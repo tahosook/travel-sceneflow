@@ -17,6 +17,15 @@ The goal is to turn travel photos and videos into a smooth, watchable video flow
 - Prioritize working code and usable outputs over perfect structure.
 - Treat docs other than `AGENTS.md` and `PLANS.md` as reference material, not as instruction layers.
 
+## Delivery Workflow
+
+- Default to `Ask -> Code -> Review` for changes that cross step boundaries, change data contracts, or affect preview quality.
+- For small tasks, implement directly, run checks, and self-review instead of adding process overhead.
+- For medium tasks, use one coding agent for implementation and a separate review pass or review agent before commit.
+- For large tasks, use `PLANS.md`, split work into staged changes, and review both data contracts and generated outputs.
+- In this repository, review should check both code quality and whether the output improves watchable scene flow.
+- Render-related changes should include output review, not only code review, because preview quality is part of the product.
+
 ## Highest Priorities
 
 - Optimize for a watchable video, not for perfect media recognition.
