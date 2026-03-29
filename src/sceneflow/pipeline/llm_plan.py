@@ -13,6 +13,17 @@ from sceneflow.workflow_utils import log, resolve_output_path, summarize_elapsed
 DEFAULT_INPUT = "edit_structure.json"
 DEFAULT_OUTPUT = "edit_plan.json"
 
+CHAPTER_TITLES = {
+    "opening": "旅のはじまり",
+    "body": "旅の流れ",
+    "closing": "旅の余韻",
+}
+CHAPTER_RENDER_TITLES = {
+    "opening": "Opening",
+    "body": "Journey",
+    "closing": "Closing",
+}
+
 
 def load_structure(path: Path) -> dict[str, object]:
     if not path.exists():
@@ -30,6 +41,79 @@ def top_tags(structure: dict[str, object], limit: int = 3) -> list[str]:
         if tag:
             tags[str(tag)] += 1
     return [tag for tag, _ in tags.most_common(limit)]
+
+
+def parse_timestamp(value: object) -> datetime | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def format_date_title(value: object) -> str | None:
+    timestamp = parse_timestamp(value)
+    if timestamp is None:
+        return None
+    return f"{timestamp.year}年{timestamp.month}月{timestamp.day}日"
+
+
+def format_date_render_title(value: object) -> str | None:
+    timestamp = parse_timestamp(value)
+    if timestamp is None:
+        return None
+    return timestamp.strftime("%Y.%m.%d")
+
+
+def build_title_cards(sequence: list[dict[str, object]]) -> list[dict[str, object]]:
+    cards: list[dict[str, object]] = []
+    previous_date: str | None = None
+    previous_chapter: str | None = None
+
+    for item in sequence:
+        scene_id = item.get("scene_id")
+        chapter_id = str(item.get("chapter_id") or "body")
+        date_title = format_date_title(item.get("start_at"))
+        date_key = date_title or ""
+        date_changed = date_key != previous_date
+        chapter_changed = chapter_id != previous_chapter
+
+        title: str | None = None
+        subtitle: str | None = None
+        kind = "chapter"
+        duration_seconds = 1.2
+
+        if date_title is not None and date_changed:
+            title = date_title
+            subtitle = CHAPTER_TITLES.get(chapter_id)
+            kind = "date"
+            duration_seconds = 1.8
+        elif chapter_changed:
+            title = CHAPTER_TITLES.get(chapter_id, chapter_id)
+            kind = "chapter"
+            duration_seconds = 1.2
+
+        if title:
+            cards.append(
+                {
+                    "scene_id": scene_id,
+                    "kind": kind,
+                    "title": title,
+                    "subtitle": subtitle,
+                    "render_title": format_date_render_title(item.get("start_at")) if kind == "date" else CHAPTER_RENDER_TITLES.get(chapter_id, chapter_id.title()),
+                    "render_subtitle": CHAPTER_RENDER_TITLES.get(chapter_id, chapter_id.title()) if kind == "date" else None,
+                    "duration_seconds": duration_seconds,
+                }
+            )
+
+        previous_date = date_key
+        previous_chapter = chapter_id
+
+    return cards
 
 
 def build_title(structure: dict[str, object]) -> str:
@@ -74,9 +158,10 @@ def build_prompt(structure: dict[str, object]) -> str:
         "次の構造化データをもとに、自然で見やすい動画の構成案を JSON で作ってください。",
         "素材理解そのものではなく、動画としての流れ、リズム、見やすさを最優先してください。",
         "OCR と顔検出は補助情報として扱い、局所最適に入り込みすぎないでください。",
-        "出力 JSON には title, logline, chapter_list, edit_sequence_notes, narration_plan, subtitle_plan を含めてください。",
+        "出力 JSON には title, logline, chapter_list, edit_sequence_notes, narration_plan, subtitle_plan, title_cards を含めてください。",
         "各 chapter は scene_id の配列を保持し、どの scene を強調するか明示してください。",
         "skip は最終手段とし、基本は並び替えと尺調整で解決してください。",
+        "title_cards は日付の切り替わりや章の切り替わりなど、大きな節目だけに絞ってください。",
     ]
     payload = {
         "summary": structure.get("summary", {}),
@@ -103,6 +188,7 @@ def build_draft_plan(structure: dict[str, object]) -> dict[str, object]:
     sequence = list(structure.get("edit_sequence", []))
     title = build_title(structure)
     logline = build_logline(structure)
+    title_cards = build_title_cards(sequence)
 
     return {
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -110,6 +196,7 @@ def build_draft_plan(structure: dict[str, object]) -> dict[str, object]:
         "title": title,
         "logline": logline,
         "chapter_list": chapters,
+        "title_cards": title_cards,
         "edit_sequence": sequence,
         "edit_sequence_notes": [
             {

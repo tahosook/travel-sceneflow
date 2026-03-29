@@ -73,11 +73,17 @@ def test_candidates_to_llm_contracts(media_info_csv: Path, sample_root: Path) ->
 
     assert set(meanings_payload) >= {"generated_at", "summary", "scenes", "scene_count"}
     assert set(structure_payload) >= {"generated_at", "summary", "chapters", "edit_sequence", "scene_count"}
-    assert set(draft_plan) >= {"title", "logline", "chapter_list", "edit_sequence", "render_guidance"}
+    assert set(draft_plan) >= {"title", "logline", "chapter_list", "title_cards", "edit_sequence", "render_guidance"}
 
+    assert meanings_payload["summary"]["role_counts"] == {"closing": 1, "opening": 1, "transition": 1}
+    assert meanings_payload["summary"]["action_counts"] == {"keep": 3}
+    assert [chapter["scene_count"] for chapter in structure_payload["chapters"]] == [1, 1, 1]
     assert [item["scene_id"] for item in structure_payload["edit_sequence"]] == [1, 2, 3]
+    assert structure_payload["edit_sequence"][0]["start_at"] == "2024-05-01T09:00:00+09:00"
     assert all(item["planned_duration_seconds"] > 0 for item in structure_payload["edit_sequence"])
     assert len(structure_payload["edit_sequence"][0]["preview_sources"]) == 3
+    assert [card["title"] for card in draft_plan["title_cards"]] == ["2024年5月1日", "旅の流れ", "旅の余韻"]
+    assert draft_plan["title_cards"][0]["subtitle"] == "旅のはじまり"
     assert len(draft_plan["edit_sequence"][1]["preview_sources"]) == 2
     assert draft_plan["render_guidance"]["preferred_order"] == [1, 2, 3]
     assert "自然で見やすい動画の構成案" in prompt_text
@@ -109,17 +115,28 @@ def test_render_builds_multiple_clips_from_preview_sources(
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(f"{input_path.name}:{duration:.2f}".encode("utf-8"))
 
+    def fake_render_title_card(card: dict[str, object], output_path: Path) -> None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(f"{card['title']}:{card.get('subtitle')}".encode("utf-8"))
+
     monkeypatch.setattr(render, "normalize_clip", fake_normalize_clip)
+    monkeypatch.setattr(render, "render_title_card", fake_render_title_card)
 
     clips = render.build_clip_list({"plan": draft_plan}, sample_root, tmp_path)
 
     assert len(materialized_media_files) == 6
-    assert len(clips) == 6
-    assert [clip["scene_id"] for clip in clips] == [1, 1, 1, 2, 2, 3]
+    assert len(clips) == 9
+    assert [clip["scene_id"] for clip in clips] == [1, 1, 1, 1, 2, 2, 2, 3, 3]
+    assert clips[0]["clip_kind"] == "title_card"
+    assert clips[0]["title"] == "2024年5月1日"
+    assert clips[0]["transition_hint"] == "fade_in"
+    assert clips[1]["preview_index"] == 1
     assert clips[1]["transition_hint"] == "cut"
-    assert clips[0]["preview_index"] == 1
-    assert clips[2]["preview_index"] == 3
-    assert clips[0]["duration_seconds"] < structure_payload["edit_sequence"][0]["planned_duration_seconds"]
+    assert clips[3]["preview_index"] == 3
+    assert clips[4]["clip_kind"] == "title_card"
+    assert clips[4]["transition_hint"] == "soft_cut"
+    assert clips[5]["transition_hint"] == "cut"
+    assert clips[1]["duration_seconds"] < structure_payload["edit_sequence"][0]["planned_duration_seconds"]
 
 
 def test_render_falls_back_to_representative_when_preview_sources_are_missing(
@@ -151,11 +168,17 @@ def test_render_falls_back_to_representative_when_preview_sources_are_missing(
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(f"{input_path.name}:{duration:.2f}".encode("utf-8"))
 
+    def fake_render_title_card(card: dict[str, object], output_path: Path) -> None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(f"{card['title']}:{card.get('subtitle')}".encode("utf-8"))
+
     monkeypatch.setattr(render, "normalize_clip", fake_normalize_clip)
+    monkeypatch.setattr(render, "render_title_card", fake_render_title_card)
 
     clips = render.build_clip_list({"plan": draft_plan}, sample_root, tmp_path)
 
     assert len(materialized_media_files) == 6
-    assert clips[0]["scene_id"] == 1
-    assert clips[0]["source_path"].endswith("overview-02.jpg")
-    assert clips[0]["preview_index"] == 1
+    assert clips[0]["clip_kind"] == "title_card"
+    assert clips[1]["scene_id"] == 1
+    assert clips[1]["source_path"].endswith("overview-02.jpg")
+    assert clips[1]["preview_index"] == 1

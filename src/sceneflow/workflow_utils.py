@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sys
 import time
 from dataclasses import dataclass
@@ -66,6 +67,28 @@ def resolve_output_path(
         resolved_run_dir = Path(OUTPUT_ROOT) / timestamp_slug()
 
     return resolved_run_dir / step_name / default_filename
+
+
+def scene_band_counts(total: int) -> tuple[int, int]:
+    """Return opening and closing counts that leave room for a body section.
+
+    Short scenes should still have a middle beat when possible, so we avoid
+    consuming the whole sequence with opening/closing buckets.
+    """
+
+    if total <= 0:
+        return 0, 0
+    if total == 1:
+        return 1, 0
+    if total == 2:
+        return 1, 1
+
+    opening = min(2, max(1, math.ceil(total * 0.15)))
+    closing = min(2, max(1, math.ceil(total * 0.15)))
+    if opening + closing >= total:
+        opening = 1
+        closing = 1 if total > 1 else 0
+    return opening, closing
 
 
 def ensure_parent_dir(path: Path) -> None:

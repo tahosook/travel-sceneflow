@@ -8,6 +8,9 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import cv2
+import numpy as np
+
 from sceneflow.workflow_utils import log, resolve_output_path, summarize_elapsed, write_manifest
 
 
@@ -18,6 +21,19 @@ VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
 FRAME_W = 1280
 FRAME_H = 720
 FPS = 30
+TITLE_CARD_BG_BGR = (32, 24, 16)
+TITLE_CARD_ACCENT_BGR = (222, 241, 244)
+TITLE_CARD_SUBTEXT_BGR = (217, 217, 217)
+CHAPTER_TITLES = {
+    "opening": "旅のはじまり",
+    "body": "旅の流れ",
+    "closing": "旅の余韻",
+}
+CHAPTER_RENDER_TITLES = {
+    "opening": "Opening",
+    "body": "Journey",
+    "closing": "Closing",
+}
 
 
 def is_missing(value: object) -> bool:
@@ -34,6 +50,89 @@ def load_plan(path: Path) -> dict[str, object]:
     if not isinstance(payload, dict) or "plan" not in payload:
         raise ValueError("edit_plan.json must contain a top-level 'plan' object")
     return payload
+
+
+def parse_timestamp(value: object) -> datetime | None:
+    if is_missing(value):
+        return None
+    try:
+        return datetime.fromisoformat(str(value).strip())
+    except ValueError:
+        return None
+
+
+def format_date_title(value: object) -> str | None:
+    timestamp = parse_timestamp(value)
+    if timestamp is None:
+        return None
+    return f"{timestamp.year}年{timestamp.month}月{timestamp.day}日"
+
+
+def format_date_render_title(value: object) -> str | None:
+    timestamp = parse_timestamp(value)
+    if timestamp is None:
+        return None
+    return timestamp.strftime("%Y.%m.%d")
+
+
+def title_cards_from_sequence(edit_items: list[dict[str, object]]) -> list[dict[str, object]]:
+    cards: list[dict[str, object]] = []
+    previous_date: str | None = None
+    previous_chapter: str | None = None
+
+    for item in edit_items:
+        if not isinstance(item, dict):
+            continue
+
+        scene_id = item.get("scene_id")
+        chapter_id = str(item.get("chapter_id") or "body")
+        date_title = format_date_title(item.get("start_at"))
+        date_key = date_title or ""
+        date_changed = date_key != previous_date
+        chapter_changed = chapter_id != previous_chapter
+
+        title: str | None = None
+        subtitle: str | None = None
+        kind = "chapter"
+        duration_seconds = 1.2
+
+        if date_title is not None and date_changed:
+            title = date_title
+            subtitle = CHAPTER_TITLES.get(chapter_id)
+            kind = "date"
+            duration_seconds = 1.8
+        elif chapter_changed:
+            title = CHAPTER_TITLES.get(chapter_id, chapter_id)
+            kind = "chapter"
+            duration_seconds = 1.2
+
+        if title:
+            cards.append(
+                {
+                    "scene_id": scene_id,
+                    "kind": kind,
+                    "title": title,
+                    "subtitle": subtitle,
+                    "render_title": format_date_render_title(item.get("start_at")) if kind == "date" else CHAPTER_RENDER_TITLES.get(chapter_id, chapter_id.title()),
+                    "render_subtitle": CHAPTER_RENDER_TITLES.get(chapter_id, chapter_id.title()) if kind == "date" else None,
+                    "duration_seconds": duration_seconds,
+                }
+            )
+
+        previous_date = date_key
+        previous_chapter = chapter_id
+
+    return cards
+
+
+def load_title_cards(plan_data: dict[str, object], edit_items: list[dict[str, object]]) -> dict[object, list[dict[str, object]]]:
+    raw_cards = plan_data.get("title_cards")
+    card_list = [card for card in raw_cards if isinstance(card, dict)] if isinstance(raw_cards, list) else title_cards_from_sequence(edit_items)
+    cards_by_scene: dict[object, list[dict[str, object]]] = {}
+    for card in card_list:
+        scene_id = card.get("scene_id")
+        cards_by_scene.setdefault(scene_id, []).append(card)
+    return cards_by_scene
 
 
 def source_duration(item: dict[str, object], source_count: int = 1) -> float:
@@ -182,6 +281,41 @@ def normalize_clip(input_path: Path, output_path: Path, duration: float) -> None
         )
 
 
+def render_title_card(card: dict[str, object], output_path: Path) -> None:
+    title = str(card.get("render_title") or card.get("title") or "").strip()
+    subtitle = str(card.get("render_subtitle") or "").strip()
+    if not title:
+        raise ValueError("Title card requires a title")
+
+    duration = max(0.8, float(card.get("duration_seconds") or 1.2))
+    canvas = np.full((FRAME_H, FRAME_W, 3), TITLE_CARD_BG_BGR, dtype=np.uint8)
+    center_x = FRAME_W // 2
+    title_font = cv2.FONT_HERSHEY_DUPLEX
+    subtitle_font = cv2.FONT_HERSHEY_SIMPLEX
+
+    title_scale = 1.6 if len(title) <= 12 else 1.2
+    title_thickness = 3
+    title_size, _ = cv2.getTextSize(title, title_font, title_scale, title_thickness)
+    title_x = max(40, center_x - title_size[0] // 2)
+    title_y = int(FRAME_H * 0.43)
+    cv2.putText(canvas, title, (title_x, title_y), title_font, title_scale, (0, 0, 0), title_thickness + 4, cv2.LINE_AA)
+    cv2.putText(canvas, title, (title_x, title_y), title_font, title_scale, TITLE_CARD_ACCENT_BGR, title_thickness, cv2.LINE_AA)
+
+    if subtitle:
+        subtitle_scale = 0.95
+        subtitle_thickness = 2
+        subtitle_size, _ = cv2.getTextSize(subtitle, subtitle_font, subtitle_scale, subtitle_thickness)
+        subtitle_x = max(40, center_x - subtitle_size[0] // 2)
+        subtitle_y = int(FRAME_H * 0.58)
+        cv2.putText(canvas, subtitle, (subtitle_x, subtitle_y), subtitle_font, subtitle_scale, (0, 0, 0), subtitle_thickness + 4, cv2.LINE_AA)
+        cv2.putText(canvas, subtitle, (subtitle_x, subtitle_y), subtitle_font, subtitle_scale, TITLE_CARD_SUBTEXT_BGR, subtitle_thickness, cv2.LINE_AA)
+
+    image_path = output_path.with_name(output_path.stem + "_source.png")
+    if not cv2.imwrite(str(image_path), canvas):
+        raise RuntimeError(f"Failed to write title card image: {image_path}")
+    normalize_clip(image_path, output_path, duration)
+
+
 def build_clip_list(plan: dict[str, object], root: Path, work_dir: Path) -> list[dict[str, object]]:
     plan_data = plan.get("plan", {})
     if not isinstance(plan_data, dict):
@@ -207,12 +341,38 @@ def build_clip_list(plan: dict[str, object], root: Path, work_dir: Path) -> list
     if not ordered_items:
         ordered_items = edit_items
 
+    cards_by_scene = load_title_cards(plan_data, ordered_items)
     clips: list[dict[str, object]] = []
     clips_dir = work_dir / "clips"
     clips_dir.mkdir(parents=True, exist_ok=True)
 
     clip_index = 1
     for item in ordered_items:
+        scene_cards = cards_by_scene.get(item.get("scene_id"), [])
+        for card_index, card in enumerate(scene_cards, start=1):
+            clip_path = clips_dir / f"{clip_index:03d}_title_{item.get('scene_id')}_{card_index:02d}.mp4"
+            render_title_card(card, clip_path)
+            card_transition = item.get("transition_hint") if card_index == 1 else "cut"
+            clips.append(
+                {
+                    "scene_id": item.get("scene_id"),
+                    "clip_kind": "title_card",
+                    "clip_path": str(clip_path),
+                    "source_path": None,
+                    "duration_seconds": float(card.get("duration_seconds") or 1.2),
+                    "chapter_id": item.get("chapter_id"),
+                    "edit_action": item.get("edit_action"),
+                    "transition_hint": card_transition,
+                    "preview_index": 0,
+                    "preview_kind": "title_card",
+                    "preview_final_timestamp": item.get("start_at"),
+                    "title_card_kind": card.get("kind"),
+                    "title": card.get("title"),
+                    "subtitle": card.get("subtitle"),
+                }
+            )
+            clip_index += 1
+
         resolved_sources = resolve_preview_sources(item, root)
         if not resolved_sources:
             continue
@@ -221,15 +381,19 @@ def build_clip_list(plan: dict[str, object], root: Path, work_dir: Path) -> list
         for preview_index, source in enumerate(resolved_sources, start=1):
             clip_path = clips_dir / f"{clip_index:03d}_scene_{item.get('scene_id')}_{preview_index:02d}.mp4"
             normalize_clip(source["source_path"], clip_path, duration)
+            transition_hint = item.get("transition_hint") if preview_index == 1 else "cut"
+            if scene_cards and preview_index == 1:
+                transition_hint = "cut"
             clips.append(
                 {
                     "scene_id": item.get("scene_id"),
+                    "clip_kind": "media",
                     "clip_path": str(clip_path),
                     "source_path": str(source["source_path"]),
                     "duration_seconds": duration,
                     "chapter_id": item.get("chapter_id"),
                     "edit_action": item.get("edit_action"),
-                    "transition_hint": item.get("transition_hint") if preview_index == 1 else "cut",
+                    "transition_hint": transition_hint,
                     "preview_index": preview_index,
                     "preview_kind": source.get("kind"),
                     "preview_final_timestamp": source.get("final_timestamp"),

@@ -6,14 +6,11 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from sceneflow.workflow_utils import log, resolve_output_path, summarize_elapsed, write_manifest
+from sceneflow.workflow_utils import log, resolve_output_path, scene_band_counts, summarize_elapsed, write_manifest
 
 
 DEFAULT_INPUT = "scene_edit_candidates.json"
 DEFAULT_OUTPUT = "scene_meanings.json"
-
-OPENING_COUNT = 2
-CLOSING_COUNT = 2
 
 OPENING_TAGS = {"風景", "夜景"}
 HIGHLIGHT_TAGS = {"食事", "寺社", "人物", "集合写真", "駅"}
@@ -79,10 +76,11 @@ def classify_role(scene: dict[str, object], index: int, total: int) -> str:
     tag = str(scene.get("representative_tag") or "")
     priority = str(scene.get("priority_band") or "low")
     importance = parse_float(scene.get("importance_score")) or 0.0
+    opening_count, closing_count = scene_band_counts(total)
 
-    if index < OPENING_COUNT:
+    if index < opening_count:
         return "opening"
-    if index >= max(0, total - CLOSING_COUNT):
+    if index >= max(0, total - closing_count):
         return "closing"
     if tag in TRANSITION_TAGS:
         return "transition"

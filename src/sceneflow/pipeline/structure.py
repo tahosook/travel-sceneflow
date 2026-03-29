@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import time
 from datetime import datetime
 from pathlib import Path
 
-from sceneflow.workflow_utils import log, resolve_output_path, summarize_elapsed, write_manifest
+from sceneflow.workflow_utils import log, resolve_output_path, scene_band_counts, summarize_elapsed, write_manifest
 
 
 DEFAULT_INPUT = "scene_meanings.json"
@@ -95,6 +94,8 @@ def build_sequence_item(scene: dict[str, object], index: int, total: int, openin
         "order": index + 1,
         "scene_id": scene.get("scene_id"),
         "chapter_id": chapter_id,
+        "start_at": scene.get("start_at"),
+        "end_at": scene.get("end_at"),
         "role": role,
         "edit_action": edit_action,
         "priority_band": priority,
@@ -146,8 +147,8 @@ def build_chapter(chapter_id: str, scenes: list[dict[str, object]]) -> dict[str,
 def build_structure(meanings: dict[str, object]) -> dict[str, object]:
     scenes = list(meanings.get("scenes") or [])
     total = len(scenes)
-    opening_end = min(total, max(2, int(math.ceil(total * 0.15))))
-    closing_span = max(2, int(math.ceil(total * 0.15)))
+    opening_span, closing_span = scene_band_counts(total)
+    opening_end = min(total, opening_span)
     closing_start = max(opening_end, total - closing_span)
 
     sequence = [build_sequence_item(scene, index, total, opening_end, closing_start) for index, scene in enumerate(scenes)]
