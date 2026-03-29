@@ -245,27 +245,6 @@ def ocr_image_with_cache(
     )
     return text, score
 
-
-def analyze_image_for_ocr(source_path: Path, cache_dir: Path) -> tuple[str, Path | None, list[Path], int]:
-    resized_path, cleanup_paths = resize_image_for_ocr(source_path)
-    if resized_path is None:
-        return "", None, cleanup_paths, 0
-
-    full_text, full_score = ocr_image_with_cache(source_path, "full", cache_dir, resized_path)
-    if full_score >= 4:
-        return full_text, resized_path, cleanup_paths, full_score
-
-    crop_path, crop_cleanup = center_crop_for_ocr(resized_path)
-    cleanup_paths.extend(crop_cleanup)
-    if crop_path is None:
-        return full_text, resized_path, cleanup_paths, full_score
-
-    crop_text, crop_score = ocr_image_with_cache(source_path, "crop", cache_dir, crop_path)
-    if crop_score > full_score:
-        return crop_text, crop_path, cleanup_paths, crop_score
-    return full_text, resized_path, cleanup_paths, full_score
-
-
 def extract_video_frame(video_path: Path) -> tuple[Path | None, list[Path]]:
     frame_path = make_temp_png_path("frame-")
     seek_seconds = 0.5

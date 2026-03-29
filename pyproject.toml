@@ -8,3 +8,16 @@ dependencies = [
     "pandas>=2.3.3",
     "opencv-python>=4.13.0.92",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.1",
+    "ruff>=0.12.10",
+]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py39"

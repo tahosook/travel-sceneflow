@@ -1,0 +1,7 @@
+path,kind,captured_at,date_time_original,create_date,gps_latitude,gps_longitude,model,laplacian,brightness,duration_seconds,has_audio
+trip/day1/overview-01.jpg,image,2024-05-01 09:00:00,2024-05-01 09:00:00,2024-05-01 09:00:00,35.6895,139.6917,iPhone,900,120,,
+trip/day1/overview-clip.mp4,video,2024-05-01 09:01:00,,2024-05-01 09:01:05,35.6896,139.6918,iPhone,,,7.0,True
+trip/day1/overview-02.jpg,image,2024-05-01 09:03:00,2024-05-01 09:03:00,2024-05-01 09:03:00,35.68955,139.69175,iPhone,1800,135,,
+trip/day1/transit-01.mp4,video,2024-05-01 09:25:00,,2024-05-01 09:25:03,35.6901,139.6922,iPhone,,,5.5,True
+trip/day1/transit-02.mp4,video,2024-05-01 09:27:00,,2024-05-01 09:27:04,35.69015,139.69225,iPhone,,,12.0,True
+trip/day1/temple-01.jpg,image,2024-05-01 10:00:00,2024-05-01 10:00:00,2024-05-01 10:00:00,35.7100,139.8107,Fujifilm,1500,142,,

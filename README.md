@@ -48,6 +48,17 @@ UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_step.py scan -
 UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_step.py candidates --help
 ```
 
+## 品質チェック
+
+開発用の check は dev 依存つきで入れます。
+
+```bash
+UV_CACHE_DIR=/tmp/uv-cache uv sync --group dev
+UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_checks.py
+```
+
+`tests/fixtures/media_info.csv` は、外部ツールなしで sceneify 以降の契約を確認するための固定 fixture です。
+
 ## 最初に読むとよいファイル
 
 - `AGENTS.md`

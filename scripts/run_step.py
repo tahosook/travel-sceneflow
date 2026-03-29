@@ -8,33 +8,35 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from sceneflow.pipeline import candidates, llm_plan, meanings, render, representatives, scan, sceneify, structure, tagging
 
+def step_main_map() -> dict[str, object]:
+    from sceneflow.pipeline import candidates, llm_plan, meanings, render, representatives, scan, sceneify, structure, tagging
 
-STEP_MAIN = {
-    "scan": scan.main,
-    "sceneify": sceneify.main,
-    "representatives": representatives.main,
-    "tagging": tagging.main,
-    "candidates": candidates.main,
-    "meanings": meanings.main,
-    "structure": structure.main,
-    "llm": llm_plan.main,
-    "render": render.main,
-}
+    return {
+        "scan": scan.main,
+        "sceneify": sceneify.main,
+        "representatives": representatives.main,
+        "tagging": tagging.main,
+        "candidates": candidates.main,
+        "meanings": meanings.main,
+        "structure": structure.main,
+        "llm": llm_plan.main,
+        "render": render.main,
+    }
 
 
 def _run_step(step_name: str, argv: list[str]) -> int:
+    step_main = step_main_map()[step_name]
     previous_argv = sys.argv[:]
     try:
         sys.argv = [step_name, *argv]
-        return int(STEP_MAIN[step_name]())
+        return int(step_main())
     finally:
         sys.argv = previous_argv
 
 
 def _usage() -> str:
-    steps = ", ".join(STEP_MAIN.keys())
+    steps = ", ".join(step_main_map().keys())
     return "\n".join(
         [
             "Usage:",
@@ -55,7 +57,8 @@ def main() -> int:
         return 0
 
     step_name = sys.argv[1].strip().lower()
-    if step_name not in STEP_MAIN:
+    step_names = step_main_map().keys()
+    if step_name not in step_names:
         print(f"Unknown step: {step_name}", file=sys.stderr)
         print(_usage(), file=sys.stderr)
         return 2
