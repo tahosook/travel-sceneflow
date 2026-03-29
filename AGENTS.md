@@ -42,10 +42,16 @@ The goal is to turn travel photos and videos into a smooth, watchable video flow
 
 ## Implementation Notes
 
+- Keep the code clean.
+- Make the smallest correct change.
 - Do not add complex branching only to improve OCR or face detection.
+- Do not introduce duplication, dead code, or unnecessary abstractions.
 - Judge features by whether they help editing decisions.
 - Do not depend too heavily on a single detection result.
 - Prefer designs that degrade gracefully when helper signals are incomplete.
+- When modifying code, leave it cleaner than before.
+- Remove anything unused or obsolete caused by the change.
+- Do not weaken tests or checks.
 
 ## Before You Finalize Changes
 
@@ -53,6 +59,7 @@ The goal is to turn travel photos and videos into a smooth, watchable video flow
 - Check whether the generated artifacts are easy for humans to review.
 - Check that the change is not a local optimization for OCR or face detection.
 - Check that the final video flow still feels natural.
+- Report `change made`, `cleanup done`, and `remaining risks`.
 
 ## Existing Assets
 
