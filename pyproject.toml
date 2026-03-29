@@ -1,0 +1,10 @@
+[project]
+name = "travel-sceneflow"
+version = "0.1.0"
+description = "Travel photos and videos organized into scenes for smooth, watchable video editing."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "pandas>=2.3.3",
+    "opencv-python>=4.13.0.92",
+]
