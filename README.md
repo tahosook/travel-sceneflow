@@ -13,8 +13,10 @@ OCR と顔検出は補助情報として扱います。
 - `src/sceneflow/pipeline/`: パイプライン本体
 - `src/sceneflow/cli.py`: パッケージ側の実行入口
 - `scripts/run_pipeline.py`: リポジトリ側の実行入口
+- `scripts/run_step.py`: 個別 step を実行する入口
 - `docs/workflow.md`: 元プロジェクトから引き継いだ詳細ワークフロー
 - `docs/plans.md`: 開発メモと今後の方針
+- `docs/ai-coding.md`: AI コーディング向けの理解メモと変更ガイド
 - `data/sample/`: ローカル smoke test 用の素材置き場
 - `outputs/`: 実行結果の出力先
 
@@ -38,6 +40,13 @@ UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_pipeline.py --
 UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_pipeline.py --root data/sample --run-dir outputs/sample-run --with-meanings --with-structure
 ```
 
+個別 step だけ確認したいときは `scripts/run_step.py` を使えます。
+
+```bash
+UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_step.py scan --help
+UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_step.py candidates --help
+```
+
 ## 最初に読むとよいファイル
 
 - `src/sceneflow/cli.py`
@@ -46,10 +55,11 @@ UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_pipeline.py --
 - `src/sceneflow/pipeline/representatives.py`
 - `src/sceneflow/pipeline/tagging.py`
 - `src/sceneflow/pipeline/candidates.py`
+- `docs/ai-coding.md`
 
 ## 補足
 
 - `data/sample/` はローカル確認用で、実素材を commit する前提ではありません。
 - `outputs/` は git 管理外のローカル生成物です。
 - フルワークフローには `ffmpeg`, `exiftool`, `tesseract` が必要です。
-- より詳しい元ワークフローは `docs/workflow.md` を参照してください。
+- `docs/workflow.md` は元ワークフロー由来の詳細メモですが、現行 repo では `scripts/run_pipeline.py` と `scripts/run_step.py` を入口として使うのが安全です。

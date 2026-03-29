@@ -6,6 +6,7 @@ The goal is to turn travel photos and videos into a smooth, watchable video flow
 
 `README.md` explains how to run the project.
 `AGENTS.md` explains how to make decisions while changing it.
+`docs/ai-coding.md` maps the pipeline responsibilities and change boundaries.
 
 ## Highest Priorities
 
@@ -24,6 +25,7 @@ The goal is to turn travel photos and videos into a smooth, watchable video flow
 ## Working Style
 
 - Follow the workflow described in `README.md`.
+- Use `docs/ai-coding.md` when you need the current pipeline map, step ownership, or safe change workflow.
 - Use `README.md` for steps and this file for priorities.
 - Preserve scene-level grouping.
 - Extract only the helper information that is needed.

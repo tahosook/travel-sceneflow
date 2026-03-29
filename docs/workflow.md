@@ -3,6 +3,9 @@
 このリポジトリは、写真・動画を走査して scene 単位にまとめ、後で編集依頼しやすい JSON を作るための作業手順を含みます。  
 動画として見やすい流れを優先し、OCR / 顔検出は補助情報として扱います。
 
+この文書は元ワークフローを整理した詳細メモです。  
+現行リポジトリでは個別 step 実行に `scripts/run_step.py`、一括実行に `scripts/run_pipeline.py` を使います。
+
 ## 目的
 
 - 画像・動画のメタデータを集める
@@ -34,7 +37,7 @@ RUN_DIR="outputs/$(date +%Y%m%d-%H%M%S)"
 まず、フォルダ内の画像・動画を走査して基本メタデータを CSV にします。
 
 ```bash
-UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/scan_media_metadata.py --root . --run-dir "$RUN_DIR"
+UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_step.py scan --root . --run-dir "$RUN_DIR"
 ```
 
 生成物:
@@ -60,7 +63,7 @@ UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/scan_media_metadat
 次に、`media_info.csv` を読み込んで、時刻補正と scene 分割を行います。
 
 ```bash
-UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/sceneify_media.py --input "$RUN_DIR/scan/media_info.csv" --run-dir "$RUN_DIR"
+UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_step.py sceneify --input "$RUN_DIR/scan/media_info.csv" --run-dir "$RUN_DIR"
 ```
 
 生成物:
@@ -75,7 +78,7 @@ UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/sceneify_media.py 
 scene ごとに代表素材を 1 件選びます。
 
 ```bash
-UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/pick_scene_representatives.py --input "$RUN_DIR/sceneify/media_scene.csv" --run-dir "$RUN_DIR"
+UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_step.py representatives --input "$RUN_DIR/sceneify/media_scene.csv" --run-dir "$RUN_DIR"
 ```
 
 生成物:
@@ -88,7 +91,7 @@ UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/pick_scene_represe
 代表素材に対して OCR と顔検出を行い、簡単なタグと caption を付けます。
 
 ```bash
-UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/tag_scene_representatives.py --input "$RUN_DIR/representatives/scene_representatives.csv" --root . --run-dir "$RUN_DIR"
+UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_step.py tagging --input "$RUN_DIR/representatives/scene_representatives.csv" --root . --run-dir "$RUN_DIR"
 ```
 
 生成物:
@@ -109,7 +112,7 @@ UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/tag_scene_represen
 最後に、scene ごとの情報をまとめて、編集依頼用の JSON を作ります。
 
 ```bash
-UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/build_scene_edit_candidates.py --media-scene "$RUN_DIR/sceneify/media_scene.csv" --representatives "$RUN_DIR/tagging/scene_representatives_tagged.csv" --root . --run-dir "$RUN_DIR"
+UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_step.py candidates --media-scene "$RUN_DIR/sceneify/media_scene.csv" --representatives "$RUN_DIR/tagging/scene_representatives_tagged.csv" --root . --run-dir "$RUN_DIR"
 ```
 
 生成物:
@@ -125,7 +128,7 @@ UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/build_scene_edit_c
 scene ごとに、編集で扱いやすい意味を付けます。
 
 ```bash
-UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/build_scene_meanings.py --input "$RUN_DIR/candidates/scene_edit_candidates.json" --run-dir "$RUN_DIR"
+UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_step.py meanings --input "$RUN_DIR/candidates/scene_edit_candidates.json" --run-dir "$RUN_DIR"
 ```
 
 生成物:
@@ -138,7 +141,7 @@ UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/build_scene_meanin
 意味づけをもとに、章立てと並び順を作ります。
 
 ```bash
-UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/build_edit_structure.py --input "$RUN_DIR/meaning/scene_meanings.json" --run-dir "$RUN_DIR"
+UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_step.py structure --input "$RUN_DIR/meaning/scene_meanings.json" --run-dir "$RUN_DIR"
 ```
 
 生成物:
@@ -151,7 +154,7 @@ UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/build_edit_structu
 編集構造をもとに、LLM に渡す入力と、今すぐ使えるドラフト構成案を作ります。
 
 ```bash
-UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/build_llm_edit_plan.py --input "$RUN_DIR/structure/edit_structure.json" --run-dir "$RUN_DIR"
+UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_step.py llm --input "$RUN_DIR/structure/edit_structure.json" --run-dir "$RUN_DIR"
 ```
 
 生成物:
@@ -165,7 +168,7 @@ UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/build_llm_edit_pla
 最後に、構成案をもとに簡易プレビュー動画を作ります。
 
 ```bash
-UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/render_edit_preview.py --input "$RUN_DIR/llm/edit_plan.json" --root . --run-dir "$RUN_DIR"
+UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_step.py render --input "$RUN_DIR/llm/edit_plan.json" --root . --run-dir "$RUN_DIR"
 ```
 
 生成物:
@@ -208,11 +211,11 @@ UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/render_edit_previe
 
 ## 推奨される作業順
 
-1. `scripts/scan_media_metadata.py` で `media_info.csv` を作る
-2. `scripts/sceneify_media.py` で `media_scene.csv` を作る
-3. `scripts/pick_scene_representatives.py` で代表素材を選ぶ
-4. `scripts/tag_scene_representatives.py` でタグを付ける
-5. `scripts/build_scene_edit_candidates.py` で JSON を作る
+1. `scripts/run_step.py scan` で `media_info.csv` を作る
+2. `scripts/run_step.py sceneify` で `media_scene.csv` を作る
+3. `scripts/run_step.py representatives` で代表素材を選ぶ
+4. `scripts/run_step.py tagging` でタグを付ける
+5. `scripts/run_step.py candidates` で JSON を作る
 
 ## 使い分け
 
