@@ -6,7 +6,16 @@ The goal is to turn travel photos and videos into a smooth, watchable video flow
 
 `README.md` explains how to run the project.
 `AGENTS.md` explains how to make decisions while changing it.
-`docs/ai-coding.md` maps the pipeline responsibilities and change boundaries.
+
+## Codex Workflow
+
+- Use `AGENTS.md` as the persistent instruction layer for this repository.
+- Use `PLANS.md` only for multi-hour or complex work that needs staged delivery.
+- Prefer minimal constraints and iterative execution over upfront design.
+- Start with the smallest working implementation, then refine only as needed.
+- Update or create documents only when needed to resolve repeated ambiguity or repeated errors.
+- Prioritize working code and usable outputs over perfect structure.
+- Treat docs other than `AGENTS.md` and `PLANS.md` as reference material, not as instruction layers.
 
 ## Highest Priorities
 
@@ -25,8 +34,8 @@ The goal is to turn travel photos and videos into a smooth, watchable video flow
 ## Working Style
 
 - Follow the workflow described in `README.md`.
-- Use `docs/ai-coding.md` when you need the current pipeline map, step ownership, or safe change workflow.
 - Use `README.md` for steps and this file for priorities.
+- For small tasks, avoid over-planning and move quickly to the smallest working change.
 - Preserve scene-level grouping.
 - Extract only the helper information that is needed.
 - Use metadata and tags to improve the final editing JSON, not as an end in themselves.
