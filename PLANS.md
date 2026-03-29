@@ -27,9 +27,14 @@
 - 代表素材選定
 - OCR / 顔検出を補助情報として付与
 - 編集候補 JSON の出力
+- `scene_meanings.json` の出力
+- `edit_structure.json` の出力
+- LLM 用 prompt / draft plan の出力
+- representative ベースの preview render
 
+ただし、後段はまだ最小実装の段階です。  
 ここから先は、素材の認識精度を上げることが主目的ではない。  
-動画としての見やすさを作るために、意味づけと編集構造を積み上げる。
+動画としての見やすさを作るために、意味づけ、編集構造、preview quality を着実に積み上げる。
 
 ## 開発方針
 

@@ -118,7 +118,8 @@
 - 現在の repo では個別 step 実行に `scripts/run_step.py` を使うのが安全
 - `python -m sceneflow...` 直実行は、そのままだと import path で迷いやすい
 - sample data は placeholder だけなので、smoke test は手元の少量素材を置いて行う
-- 自動テスト群はまだ薄いので、生成物レビューが重要
+- `scripts/run_checks.py` と fixture ベースの契約テストは入っているが、`scan`, `tagging`, `render` の外部ツール依存部分はまだ薄い
+- そのため、自動チェックに加えて生成物レビューも引き続き重要
 
 ## 実行入口
 
@@ -134,6 +135,13 @@ UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_pipeline.py --
 UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_step.py scan --help
 UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_step.py sceneify --help
 UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_step.py candidates --help
+```
+
+品質チェック:
+
+```bash
+UV_CACHE_DIR=/tmp/uv-cache uv sync --group dev
+UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_checks.py
 ```
 
 ## AI 作業の最小チェックリスト
