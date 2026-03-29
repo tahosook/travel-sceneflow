@@ -90,10 +90,11 @@
 - `sceneify` の出力 CSV は downstream が読む列を極力壊さない
 - `representatives` は scene ごとに 1 行であることを保つ
 - `candidates` の top-level には `generated_at`, `root`, `scene_count`, `summary`, `scenes` があること
+- scene record には render 用の小さい `preview_sources` を持てるが、全 asset 列挙には戻さないこと
 - `meanings` の top-level には `summary`, `scenes` があること
 - `structure` の top-level には `chapters`, `edit_sequence` があること
 - `llm` の top-level には `plan` があること
-- `render` は `edit_plan.json` の representative path に依存する
+- `render` は `preview_sources` を優先し、なければ representative path に fallback する
 
 ## どこを変えるときに何を見るか
 

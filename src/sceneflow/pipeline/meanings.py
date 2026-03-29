@@ -131,6 +131,7 @@ def build_scene_record(scene: dict[str, object], index: int, total: int) -> dict
         "flow_summary": scene.get("flow_summary"),
         "chapter_hint": "opening" if role == "opening" else "ending" if role == "closing" else "body",
         "notes": reasons[:6],
+        "preview_sources": list(scene.get("preview_sources") or []),
         "representative": {
             "path": rep.get("path"),
             "kind": rep.get("kind"),

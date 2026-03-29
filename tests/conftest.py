@@ -35,3 +35,14 @@ def media_info_csv(tmp_path: Path, media_info_df: pd.DataFrame) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     media_info_df.to_csv(path, index=False)
     return path
+
+
+@pytest.fixture
+def materialized_media_files(media_info_df: pd.DataFrame) -> list[Path]:
+    created: list[Path] = []
+    for value in media_info_df["path"].tolist():
+        path = Path(str(value))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"fixture")
+        created.append(path)
+    return created

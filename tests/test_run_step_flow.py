@@ -64,5 +64,7 @@ def test_run_step_pipeline_smoke(media_info_csv: Path, sample_root: Path, tmp_pa
 
     assert candidates_payload["scene_count"] == 3
     assert len(candidates_payload["scenes"]) == 3
+    assert len(candidates_payload["scenes"][0]["preview_sources"]) == 3
     assert len(structure_payload["edit_sequence"]) == 3
+    assert len(llm_payload["plan"]["edit_sequence"][0]["preview_sources"]) == 3
     assert llm_payload["plan"]["render_guidance"]["preferred_order"] == [1, 2, 3]

@@ -16,6 +16,7 @@ DEFAULT_MEDIA_SCENE = "media_scene.csv"
 DEFAULT_REPRESENTATIVES = "scene_representatives_tagged.csv"
 DEFAULT_OUTPUT = "scene_edit_candidates.json"
 TZ_NAME = "Asia/Tokyo"
+PREVIEW_SOURCE_LIMIT = 3
 
 TAG_STRENGTH = {
     "人物": "strong",
@@ -233,21 +234,34 @@ def compute_gps_summary(group: pd.DataFrame) -> dict[str, object]:
     }
 
 
-def summarize_assets(group: pd.DataFrame, root: Path) -> list[dict[str, object]]:
+def preview_source_indices(count: int, limit: int = PREVIEW_SOURCE_LIMIT) -> list[int]:
+    if count <= 0:
+        return []
+    if count <= limit:
+        return list(range(count))
+    if limit <= 1:
+        return [count // 2]
+
+    last_index = count - 1
+    indices: list[int] = []
+    for offset in range(limit):
+        index = int(round(offset * last_index / (limit - 1)))
+        if index not in indices:
+            indices.append(index)
+    return indices
+
+
+def build_preview_sources(group: pd.DataFrame, root: Path) -> list[dict[str, object]]:
+    ordered = group.sort_values("final_timestamp_dt", kind="stable").reset_index(drop=True)
     rows: list[dict[str, object]] = []
-    ordered = group.sort_values("final_timestamp_dt", kind="stable")
-    for _, row in ordered.iterrows():
+    for index in preview_source_indices(len(ordered)):
+        row = ordered.iloc[index]
         rows.append(
             {
                 "path": relpath(row.get("path"), root),
                 "kind": row.get("kind"),
                 "final_timestamp": format_timestamp(row.get("final_timestamp_dt")),
-                "captured_at": format_timestamp(parse_timestamp(row.get("captured_at"))),
                 "duration_seconds": parse_float(row.get("duration_seconds")),
-                "gps_latitude": parse_float(row.get("gps_latitude")),
-                "gps_longitude": parse_float(row.get("gps_longitude")),
-                "has_audio": None if is_missing(row.get("has_audio")) else bool(row.get("has_audio")),
-                "model": None if is_missing(row.get("model")) else str(row.get("model")),
             }
         )
     return rows
@@ -486,6 +500,7 @@ def build_scene_records(media_scene: pd.DataFrame, reps: pd.DataFrame, root: Pat
             "representative_tag": rep_tag,
             "meaningful_ocr_token_count": len(tokens),
             "meaningful_ocr_tokens": tokens,
+            "preview_sources": build_preview_sources(group, root),
             "representative": None,
         }
 

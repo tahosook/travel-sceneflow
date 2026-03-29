@@ -104,6 +104,7 @@ def build_sequence_item(scene: dict[str, object], index: int, total: int, openin
         "summary": scene.get("summary"),
         "flow_summary": scene.get("flow_summary"),
         "representative_tag": scene.get("representative_tag"),
+        "preview_sources": list(scene.get("preview_sources") or []),
         "representative_path": representative.get("path"),
         "representative_kind": representative.get("kind"),
         "representative_caption": representative.get("caption"),

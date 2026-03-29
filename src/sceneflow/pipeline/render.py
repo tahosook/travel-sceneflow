@@ -36,23 +36,86 @@ def load_plan(path: Path) -> dict[str, object]:
     return payload
 
 
-def source_duration(item: dict[str, object]) -> float:
+def source_duration(item: dict[str, object], source_count: int = 1) -> float:
     value = item.get("planned_duration_seconds")
     try:
         duration = float(value)
     except Exception:
         duration = 2.0
+    if source_count > 1:
+        return max(0.8, min(duration / max(source_count, 1), 1.6))
     return max(1.0, min(duration, 4.0))
 
 
-def source_path(item: dict[str, object], root: Path) -> Path | None:
-    path_value = item.get("representative_path")
+def resolve_source_path(path_value: object, root: Path) -> Path | None:
     if is_missing(path_value):
         return None
     path = Path(str(path_value))
     if path.is_absolute():
         return path
     return root / path
+
+
+def preview_sources(item: dict[str, object]) -> list[dict[str, object]]:
+    raw_sources = item.get("preview_sources")
+    if isinstance(raw_sources, list):
+        sources = [source for source in raw_sources if isinstance(source, dict) and not is_missing(source.get("path"))]
+        if sources:
+            return sources
+    if is_missing(item.get("representative_path")):
+        return []
+    return [
+        {
+            "path": item.get("representative_path"),
+            "kind": item.get("representative_kind"),
+            "duration_seconds": None,
+            "final_timestamp": None,
+        }
+    ]
+
+
+def representative_source(item: dict[str, object]) -> dict[str, object] | None:
+    if is_missing(item.get("representative_path")):
+        return None
+    return {
+        "path": item.get("representative_path"),
+        "kind": item.get("representative_kind"),
+        "duration_seconds": None,
+        "final_timestamp": None,
+    }
+
+
+def resolve_preview_sources(item: dict[str, object], root: Path) -> list[dict[str, object]]:
+    resolved_sources: list[dict[str, object]] = []
+    for source in preview_sources(item):
+        src = resolve_source_path(source.get("path"), root)
+        if src is None or not src.exists():
+            continue
+        resolved_sources.append(
+            {
+                "source_path": src,
+                "kind": source.get("kind"),
+                "final_timestamp": source.get("final_timestamp"),
+            }
+        )
+
+    if resolved_sources:
+        return resolved_sources
+
+    representative = representative_source(item)
+    if representative is None:
+        return []
+
+    src = resolve_source_path(representative.get("path"), root)
+    if src is None or not src.exists():
+        return []
+    return [
+        {
+            "source_path": src,
+            "kind": representative.get("kind"),
+            "final_timestamp": representative.get("final_timestamp"),
+        }
+    ]
 
 
 def normalize_clip(input_path: Path, output_path: Path, duration: float) -> None:
@@ -148,24 +211,31 @@ def build_clip_list(plan: dict[str, object], root: Path, work_dir: Path) -> list
     clips_dir = work_dir / "clips"
     clips_dir.mkdir(parents=True, exist_ok=True)
 
-    for index, item in enumerate(ordered_items, start=1):
-        src = source_path(item, root)
-        if src is None or not src.exists():
+    clip_index = 1
+    for item in ordered_items:
+        resolved_sources = resolve_preview_sources(item, root)
+        if not resolved_sources:
             continue
-        duration = source_duration(item)
-        clip_path = clips_dir / f"{index:03d}_scene_{item.get('scene_id')}.mp4"
-        normalize_clip(src, clip_path, duration)
-        clips.append(
-            {
-                "scene_id": item.get("scene_id"),
-                "clip_path": str(clip_path),
-                "source_path": str(src),
-                "duration_seconds": duration,
-                "chapter_id": item.get("chapter_id"),
-                "edit_action": item.get("edit_action"),
-                "transition_hint": item.get("transition_hint"),
-            }
-        )
+
+        duration = source_duration(item, len(resolved_sources))
+        for preview_index, source in enumerate(resolved_sources, start=1):
+            clip_path = clips_dir / f"{clip_index:03d}_scene_{item.get('scene_id')}_{preview_index:02d}.mp4"
+            normalize_clip(source["source_path"], clip_path, duration)
+            clips.append(
+                {
+                    "scene_id": item.get("scene_id"),
+                    "clip_path": str(clip_path),
+                    "source_path": str(source["source_path"]),
+                    "duration_seconds": duration,
+                    "chapter_id": item.get("chapter_id"),
+                    "edit_action": item.get("edit_action"),
+                    "transition_hint": item.get("transition_hint") if preview_index == 1 else "cut",
+                    "preview_index": preview_index,
+                    "preview_kind": source.get("kind"),
+                    "preview_final_timestamp": source.get("final_timestamp"),
+                }
+            )
+            clip_index += 1
 
     return clips
 
