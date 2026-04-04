@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import subprocess
 import tempfile
 import time
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 
 import cv2
@@ -34,6 +37,123 @@ CHAPTER_RENDER_TITLES = {
     "body": "Journey",
     "closing": "Closing",
 }
+OVERLAY_FONT_GLOBS = [
+    "/Library/Fonts/Arial Unicode.ttf",
+    "/System/Library/Fonts/ヒラ*W6.ttc",
+    "/System/Library/Fonts/ヒラ*W5.ttc",
+    "/System/Library/Fonts/Helvetica.ttc",
+]
+SWIFT_OVERLAY_SCRIPT = r"""
+import AppKit
+import Foundation
+
+guard CommandLine.arguments.count >= 4 else {
+    fputs("usage: overlay_text.swift <output> <style> <text>\n", stderr)
+    exit(2)
+}
+
+let outputPath = CommandLine.arguments[1]
+let style = CommandLine.arguments[2]
+let text = CommandLine.arguments[3]
+
+let frameWidth: CGFloat = 1280
+let frameHeight: CGFloat = 720
+
+struct Config {
+    let fontSize: CGFloat
+    let padding: CGFloat
+    let maxWidth: CGFloat
+    let leftInset: CGFloat
+    let topInset: CGFloat
+    let bottomInset: CGFloat
+    let centered: Bool
+}
+
+func config(for style: String) -> Config {
+    switch style {
+    case "title":
+        return Config(fontSize: 44, padding: 18, maxWidth: 540, leftInset: 56, topInset: 50, bottomInset: 0, centered: false)
+    case "label":
+        return Config(fontSize: 28, padding: 14, maxWidth: 520, leftInset: 56, topInset: 122, bottomInset: 0, centered: false)
+    default:
+        return Config(fontSize: 36, padding: 16, maxWidth: 880, leftInset: 0, topInset: 0, bottomInset: 56, centered: true)
+    }
+}
+
+let cfg = config(for: style)
+let font = NSFont(name: "Hiragino Sans W6", size: cfg.fontSize)
+    ?? NSFont(name: "Arial Unicode MS", size: cfg.fontSize)
+    ?? NSFont.systemFont(ofSize: cfg.fontSize, weight: style == "title" ? .semibold : .regular)
+let paragraph = NSMutableParagraphStyle()
+paragraph.alignment = cfg.centered ? .center : .left
+paragraph.lineBreakMode = .byWordWrapping
+
+let attrs: [NSAttributedString.Key: Any] = [
+    .font: font,
+    .foregroundColor: NSColor.white,
+    .paragraphStyle: paragraph,
+]
+
+let attributed = NSAttributedString(string: text, attributes: attrs)
+let textBounds = attributed.boundingRect(
+    with: NSSize(width: cfg.maxWidth, height: frameHeight),
+    options: [.usesLineFragmentOrigin, .usesFontLeading]
+)
+let textSize = NSSize(width: ceil(min(textBounds.width, cfg.maxWidth)), height: ceil(textBounds.height))
+
+let boxRect: NSRect
+if cfg.centered {
+    let x = floor((frameWidth - textSize.width) / 2.0 - cfg.padding)
+    boxRect = NSRect(
+        x: x,
+        y: cfg.bottomInset - cfg.padding,
+        width: textSize.width + cfg.padding * 2.0,
+        height: textSize.height + cfg.padding * 2.0
+    )
+} else {
+    boxRect = NSRect(
+        x: cfg.leftInset,
+        y: frameHeight - cfg.topInset - textSize.height - cfg.padding * 2.0,
+        width: textSize.width + cfg.padding * 2.0,
+        height: textSize.height + cfg.padding * 2.0
+    )
+}
+
+let textRect = NSRect(
+    x: boxRect.minX + cfg.padding,
+    y: boxRect.minY + cfg.padding,
+    width: textSize.width,
+    height: textSize.height
+)
+
+let image = NSImage(size: NSSize(width: frameWidth, height: frameHeight))
+image.lockFocus()
+NSColor.clear.setFill()
+NSRect(x: 0, y: 0, width: frameWidth, height: frameHeight).fill()
+
+NSColor(calibratedWhite: 0.0, alpha: 0.45).setFill()
+let boxPath = NSBezierPath(roundedRect: boxRect, xRadius: 16, yRadius: 16)
+boxPath.fill()
+attributed.draw(with: textRect, options: [.usesLineFragmentOrigin, .usesFontLeading])
+
+image.unlockFocus()
+
+guard
+    let tiffData = image.tiffRepresentation,
+    let bitmap = NSBitmapImageRep(data: tiffData),
+    let pngData = bitmap.representation(using: .png, properties: [:])
+else {
+    fputs("failed to encode PNG\n", stderr)
+    exit(1)
+}
+
+do {
+    try pngData.write(to: URL(fileURLWithPath: outputPath))
+} catch {
+    fputs("failed to write PNG: \(error)\n", stderr)
+    exit(1)
+}
+"""
 
 
 def is_missing(value: object) -> bool:
@@ -41,6 +161,19 @@ def is_missing(value: object) -> bool:
         return True
     text = str(value).strip()
     return text == "" or text.lower() == "none"
+
+
+def parse_float(value: object, default: float = 0.0) -> float:
+    if is_missing(value):
+        return default
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def command_exists(name: str) -> bool:
+    return shutil.which(name) is not None
 
 
 def load_plan(path: Path) -> dict[str, object]:
@@ -135,6 +268,24 @@ def load_title_cards(plan_data: dict[str, object], edit_items: list[dict[str, ob
     return cards_by_scene
 
 
+def load_subtitle_items(plan_data: dict[str, object]) -> dict[object, list[dict[str, object]]]:
+    subtitle_plan = plan_data.get("subtitle_plan")
+    if not isinstance(subtitle_plan, dict) or not subtitle_plan.get("enabled"):
+        return {}
+
+    raw_items = subtitle_plan.get("items")
+    if not isinstance(raw_items, list):
+        return {}
+
+    subtitles_by_scene: dict[object, list[dict[str, object]]] = {}
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        scene_id = item.get("scene_id")
+        subtitles_by_scene.setdefault(scene_id, []).append(item)
+    return subtitles_by_scene
+
+
 def source_duration(item: dict[str, object], source_count: int = 1) -> float:
     value = item.get("planned_duration_seconds")
     try:
@@ -217,9 +368,335 @@ def resolve_preview_sources(item: dict[str, object], root: Path) -> list[dict[st
     ]
 
 
-def normalize_clip(input_path: Path, output_path: Path, duration: float) -> None:
+def discover_overlay_font() -> str | None:
+    for pattern in OVERLAY_FONT_GLOBS:
+        direct_path = Path(pattern)
+        if direct_path.exists():
+            return str(direct_path)
+
+        parent = direct_path.parent
+        if parent.exists():
+            matches = sorted(parent.glob(direct_path.name))
+            if matches:
+                return str(matches[0])
+    return None
+
+
+@lru_cache(maxsize=None)
+def ffmpeg_supports_filter(filter_name: str) -> bool:
+    result = subprocess.run(["ffmpeg", "-filters"], capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        return False
+    return filter_name in result.stdout
+
+
+@lru_cache(maxsize=1)
+def overlay_backend() -> str:
+    if ffmpeg_supports_filter("drawtext"):
+        return "drawtext"
+    if ffmpeg_supports_filter("overlay") and command_exists("swiftc"):
+        return "overlay_image"
+    return "none"
+
+
+def ensure_swift_overlay_script(work_dir: Path) -> Path:
+    script_path = work_dir / "render_overlay_text.swift"
+    if not script_path.exists():
+        script_path.write_text(SWIFT_OVERLAY_SCRIPT, encoding="utf-8")
+    return script_path
+
+
+def ensure_swift_overlay_binary(work_dir: Path) -> Path:
+    script_path = ensure_swift_overlay_script(work_dir)
+    binary_path = work_dir / "render_overlay_text"
+    if binary_path.exists():
+        return binary_path
+
+    module_cache = work_dir / "swift-module-cache"
+    module_cache.mkdir(parents=True, exist_ok=True)
+    swift_env = dict(os.environ)
+    swift_env["CLANG_MODULE_CACHE_PATH"] = str(module_cache)
+    swift_env["SWIFT_MODULECACHE_PATH"] = str(module_cache)
+
+    cmd = ["swiftc", str(script_path), "-o", str(binary_path)]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False, env=swift_env)
+    if result.returncode != 0 or not binary_path.exists():
+        raise RuntimeError(
+            f"Failed to compile overlay renderer: {binary_path}\n"
+            f"stdout={result.stdout[-1000:]}\n"
+            f"stderr={result.stderr[-1000:]}"
+        )
+    return binary_path
+
+
+def normalize_overlay_text(value: object) -> str:
+    if is_missing(value):
+        return ""
+    return " ".join(str(value).replace("\r", " ").replace("\n", " ").split()).strip()
+
+
+def wrap_overlay_text(text: str, *, line_limit: int, max_lines: int) -> str:
+    normalized = normalize_overlay_text(text)
+    if not normalized:
+        return ""
+    if len(normalized) <= line_limit:
+        return normalized
+
+    lines: list[str] = []
+    remaining = normalized
+    while remaining and len(lines) < max_lines:
+        lines.append(remaining[:line_limit])
+        remaining = remaining[line_limit:]
+
+    if remaining and lines:
+        if len(lines[-1]) >= 1:
+            lines[-1] = lines[-1][:-1] + "…"
+        else:
+            lines[-1] = "…"
+    return "\n".join(line for line in lines if line)
+
+
+def escape_filter_value(value: object) -> str:
+    text = str(value)
+    text = text.replace("\\", "\\\\")
+    text = text.replace(":", r"\:")
+    text = text.replace("'", r"\'")
+    return f"'{text}'"
+
+
+def should_render_title_card_as_clip(card: dict[str, object]) -> bool:
+    presentation = str(card.get("presentation") or card.get("render_mode") or "overlay").strip().lower()
+    return presentation in {"card", "full_card", "standalone"}
+
+
+def build_scene_overlays(scene_cards: list[dict[str, object]], subtitle_items: list[dict[str, object]]) -> list[dict[str, object]]:
+    overlays: list[dict[str, object]] = []
+    title_overlay_present = False
+
+    for card in scene_cards:
+        presentation = str(card.get("presentation") or card.get("render_mode") or "overlay").strip().lower()
+        if presentation in {"hidden", "none", "off"}:
+            continue
+        if should_render_title_card_as_clip(card):
+            continue
+
+        duration_seconds = max(0.8, parse_float(card.get("duration_seconds"), 1.6))
+        title = normalize_overlay_text(card.get("title") or card.get("render_title"))
+        subtitle = normalize_overlay_text(card.get("subtitle") or card.get("render_subtitle"))
+
+        if title:
+            overlays.append(
+                {
+                    "text": title,
+                    "style": "title",
+                    "position": "top_left",
+                    "start_seconds": 0.0,
+                    "duration_seconds": duration_seconds,
+                }
+            )
+            title_overlay_present = True
+        if subtitle:
+            overlays.append(
+                {
+                    "text": subtitle,
+                    "style": "label",
+                    "position": "top_left_secondary",
+                    "start_seconds": 0.1,
+                    "duration_seconds": duration_seconds,
+                }
+            )
+            title_overlay_present = True
+
+    subtitle_delay = 0.8 if title_overlay_present else 0.2
+    for item in subtitle_items:
+        text = normalize_overlay_text(item.get("text"))
+        if not text:
+            continue
+        overlays.append(
+            {
+                "text": text,
+                "style": "subtitle",
+                "position": str(item.get("position") or "bottom_center"),
+                "start_seconds": max(parse_float(item.get("start_seconds"), 0.0), subtitle_delay),
+                "duration_seconds": max(1.2, parse_float(item.get("duration_seconds"), 2.5)),
+            }
+        )
+
+    return overlays
+
+
+def overlay_style_config(style: str, position: str) -> dict[str, object]:
+    if style == "title":
+        return {
+            "font_size": 44,
+            "line_limit": 18,
+            "max_lines": 2,
+            "x": "56",
+            "y": "50",
+            "box_border": 18,
+        }
+    if style == "label":
+        return {
+            "font_size": 28,
+            "line_limit": 24,
+            "max_lines": 2,
+            "x": "56",
+            "y": "122",
+            "box_border": 14,
+        }
+    if position == "bottom_center":
+        return {
+            "font_size": 36,
+            "line_limit": 22,
+            "max_lines": 2,
+            "x": "(w-text_w)/2",
+            "y": "h-text_h-56",
+            "box_border": 16,
+        }
+    return {
+        "font_size": 34,
+        "line_limit": 22,
+        "max_lines": 2,
+        "x": "(w-text_w)/2",
+        "y": "h-text_h-56",
+        "box_border": 16,
+    }
+
+
+def build_overlay_filters(overlays: list[dict[str, object]], output_path: Path, clip_duration: float) -> list[str]:
+    if not overlays:
+        return []
+
+    fontfile = discover_overlay_font()
+    filters: list[str] = []
+
+    for index, overlay in enumerate(overlays, start=1):
+        style = str(overlay.get("style") or "subtitle")
+        position = str(overlay.get("position") or "bottom_center")
+        style_config = overlay_style_config(style, position)
+        text = wrap_overlay_text(
+            str(overlay.get("text") or ""),
+            line_limit=int(style_config["line_limit"]),
+            max_lines=int(style_config["max_lines"]),
+        )
+        if not text:
+            continue
+
+        start_seconds = max(0.0, parse_float(overlay.get("start_seconds"), 0.0))
+        overlay_duration = max(0.3, parse_float(overlay.get("duration_seconds"), 2.0))
+        end_seconds = min(clip_duration, start_seconds + overlay_duration)
+        if end_seconds <= start_seconds:
+            continue
+
+        textfile_path = output_path.with_name(f"{output_path.stem}_overlay_{index:02d}.txt")
+        textfile_path.write_text(text, encoding="utf-8")
+
+        parts = [
+            f"textfile={escape_filter_value(textfile_path)}",
+            "fontcolor=white",
+            f"fontsize={style_config['font_size']}",
+            f"x={style_config['x']}",
+            f"y={style_config['y']}",
+            "line_spacing=10",
+            "box=1",
+            "boxcolor=black@0.45",
+            f"boxborderw={style_config['box_border']}",
+            "borderw=1",
+            "bordercolor=black@0.25",
+            "fix_bounds=true",
+            f"enable='between(t,{start_seconds:.2f},{end_seconds:.2f})'",
+        ]
+        if fontfile:
+            parts.insert(1, f"fontfile={escape_filter_value(fontfile)}")
+        filters.append("drawtext=" + ":".join(parts))
+
+    return filters
+
+
+def build_overlay_image_assets(overlays: list[dict[str, object]], output_path: Path, clip_duration: float) -> list[dict[str, object]]:
+    if not overlays:
+        return []
+
+    binary_path = ensure_swift_overlay_binary(output_path.parent)
+    module_cache = output_path.parent / "swift-module-cache"
+    module_cache.mkdir(parents=True, exist_ok=True)
+    swift_env = dict(os.environ)
+    swift_env["CLANG_MODULE_CACHE_PATH"] = str(module_cache)
+    swift_env["SWIFT_MODULECACHE_PATH"] = str(module_cache)
+    assets: list[dict[str, object]] = []
+
+    for index, overlay in enumerate(overlays, start=1):
+        style = str(overlay.get("style") or "subtitle")
+        position = str(overlay.get("position") or "bottom_center")
+        style_config = overlay_style_config(style, position)
+        text = wrap_overlay_text(
+            str(overlay.get("text") or ""),
+            line_limit=int(style_config["line_limit"]),
+            max_lines=int(style_config["max_lines"]),
+        )
+        if not text:
+            continue
+
+        start_seconds = max(0.0, parse_float(overlay.get("start_seconds"), 0.0))
+        overlay_duration = max(0.3, parse_float(overlay.get("duration_seconds"), 2.0))
+        end_seconds = min(clip_duration, start_seconds + overlay_duration)
+        if end_seconds <= start_seconds:
+            continue
+
+        asset_path = output_path.with_name(f"{output_path.stem}_overlay_{index:02d}.png")
+        cmd = [str(binary_path), str(asset_path), style, text]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False, env=swift_env)
+        if result.returncode != 0 or not asset_path.exists():
+            raise RuntimeError(
+                f"Failed to render overlay asset: {asset_path}\n"
+                f"stdout={result.stdout[-1000:]}\n"
+                f"stderr={result.stderr[-1000:]}"
+            )
+
+        assets.append(
+            {
+                "path": asset_path,
+                "start_seconds": start_seconds,
+                "end_seconds": end_seconds,
+            }
+        )
+
+    return assets
+
+
+def build_overlay_complex_filter(overlay_assets: list[dict[str, object]]) -> tuple[str, str]:
+    base_filters = [
+        f"[0:v]scale={FRAME_W}:{FRAME_H}:force_original_aspect_ratio=decrease",
+        f"pad={FRAME_W}:{FRAME_H}:(ow-iw)/2:(oh-ih)/2",
+        f"fps={FPS}",
+        "format=rgba[base0]",
+    ]
+    filter_parts = [",".join(base_filters)]
+
+    current_label = "base0"
+    for index, asset in enumerate(overlay_assets, start=1):
+        next_label = f"base{index}"
+        filter_parts.append(
+            f"[{current_label}][{index}:v]overlay=0:0:enable='between(t,{asset['start_seconds']:.2f},{asset['end_seconds']:.2f})'[{next_label}]"
+        )
+        current_label = next_label
+
+    filter_parts.append(f"[{current_label}]format=yuv420p[outv]")
+    return ";".join(filter_parts), "[outv]"
+
+
+def normalize_clip(input_path: Path, output_path: Path, duration: float, overlays: list[dict[str, object]] | None = None) -> None:
     suffix = input_path.suffix.lower()
-    vf = f"scale={FRAME_W}:{FRAME_H}:force_original_aspect_ratio=decrease,pad={FRAME_W}:{FRAME_H}:(ow-iw)/2:(oh-ih)/2,format=yuv420p,fps={FPS}"
+    backend = overlay_backend() if overlays else "none"
+    vf_filters = [
+        f"scale={FRAME_W}:{FRAME_H}:force_original_aspect_ratio=decrease",
+        f"pad={FRAME_W}:{FRAME_H}:(ow-iw)/2:(oh-ih)/2",
+        "format=yuv420p",
+        f"fps={FPS}",
+    ]
+    if backend == "drawtext":
+        vf_filters.extend(build_overlay_filters(overlays or [], output_path, duration))
+    vf = ",".join(vf_filters)
     if suffix in IMAGE_EXTS:
         raster_path = output_path.with_suffix(".png")
         raster_cmd = [
@@ -238,32 +715,50 @@ def normalize_clip(input_path: Path, output_path: Path, duration: float) -> None
                 f"stdout={raster_result.stdout[-1000:]}\n"
                 f"stderr={raster_result.stderr[-1000:]}"
             )
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-loop",
-            "1",
-            "-t",
-            f"{duration:.2f}",
-            "-i",
-            str(raster_path),
-            "-vf",
-            vf,
-            "-an",
-            "-movflags",
-            "+faststart",
-            str(output_path),
-        ]
+        source_path = raster_path
+        source_cmd = ["-loop", "1", "-t", f"{duration:.2f}", "-i", str(source_path)]
+    else:
+        source_path = input_path
+        source_cmd = ["-ss", "0", "-t", f"{duration:.2f}", "-i", str(source_path)]
+
+    if backend == "overlay_image":
+        overlay_assets = build_overlay_image_assets(overlays or [], output_path, duration)
+        cmd = ["ffmpeg", "-y", *source_cmd]
+        for asset in overlay_assets:
+            cmd.extend(["-loop", "1", "-i", str(asset["path"])])
+        if overlay_assets:
+            filter_complex, output_label = build_overlay_complex_filter(overlay_assets)
+            cmd.extend(
+                [
+                    "-filter_complex",
+                    filter_complex,
+                    "-map",
+                    output_label,
+                    "-an",
+                    "-shortest",
+                    "-t",
+                    f"{duration:.2f}",
+                    "-movflags",
+                    "+faststart",
+                    str(output_path),
+                ]
+            )
+        else:
+            cmd.extend(
+                [
+                    "-vf",
+                    vf,
+                    "-an",
+                    "-movflags",
+                    "+faststart",
+                    str(output_path),
+                ]
+            )
     else:
         cmd = [
             "ffmpeg",
             "-y",
-            "-ss",
-            "0",
-            "-t",
-            f"{duration:.2f}",
-            "-i",
-            str(input_path),
+            *source_cmd,
             "-vf",
             vf,
             "-an",
@@ -282,8 +777,8 @@ def normalize_clip(input_path: Path, output_path: Path, duration: float) -> None
 
 
 def render_title_card(card: dict[str, object], output_path: Path) -> None:
-    title = str(card.get("render_title") or card.get("title") or "").strip()
-    subtitle = str(card.get("render_subtitle") or "").strip()
+    title = str(card.get("title") or card.get("render_title") or "").strip()
+    subtitle = str(card.get("subtitle") or card.get("render_subtitle") or "").strip()
     if not title:
         raise ValueError("Title card requires a title")
 
@@ -342,6 +837,7 @@ def build_clip_list(plan: dict[str, object], root: Path, work_dir: Path) -> list
         ordered_items = edit_items
 
     cards_by_scene = load_title_cards(plan_data, ordered_items)
+    subtitles_by_scene = load_subtitle_items(plan_data)
     clips: list[dict[str, object]] = []
     clips_dir = work_dir / "clips"
     clips_dir.mkdir(parents=True, exist_ok=True)
@@ -349,7 +845,8 @@ def build_clip_list(plan: dict[str, object], root: Path, work_dir: Path) -> list
     clip_index = 1
     for item in ordered_items:
         scene_cards = cards_by_scene.get(item.get("scene_id"), [])
-        for card_index, card in enumerate(scene_cards, start=1):
+        standalone_cards = [card for card in scene_cards if should_render_title_card_as_clip(card)]
+        for card_index, card in enumerate(standalone_cards, start=1):
             clip_path = clips_dir / f"{clip_index:03d}_title_{item.get('scene_id')}_{card_index:02d}.mp4"
             render_title_card(card, clip_path)
             card_transition = item.get("transition_hint") if card_index == 1 else "cut"
@@ -378,11 +875,13 @@ def build_clip_list(plan: dict[str, object], root: Path, work_dir: Path) -> list
             continue
 
         duration = source_duration(item, len(resolved_sources))
+        scene_overlays = build_scene_overlays(scene_cards, subtitles_by_scene.get(item.get("scene_id"), []))
         for preview_index, source in enumerate(resolved_sources, start=1):
             clip_path = clips_dir / f"{clip_index:03d}_scene_{item.get('scene_id')}_{preview_index:02d}.mp4"
-            normalize_clip(source["source_path"], clip_path, duration)
+            clip_overlays = scene_overlays if preview_index == 1 else []
+            normalize_clip(source["source_path"], clip_path, duration, overlays=clip_overlays)
             transition_hint = item.get("transition_hint") if preview_index == 1 else "cut"
-            if scene_cards and preview_index == 1:
+            if standalone_cards and preview_index == 1:
                 transition_hint = "cut"
             clips.append(
                 {
@@ -397,6 +896,7 @@ def build_clip_list(plan: dict[str, object], root: Path, work_dir: Path) -> list
                     "preview_index": preview_index,
                     "preview_kind": source.get("kind"),
                     "preview_final_timestamp": source.get("final_timestamp"),
+                    "overlays": clip_overlays,
                 }
             )
             clip_index += 1

@@ -20,9 +20,12 @@ def main() -> int:
     parser.add_argument('--run-dir', default=None, help='Shared run directory under outputs/')
     parser.add_argument('--with-meanings', action='store_true', help='Also build scene_meanings.json')
     parser.add_argument('--with-structure', action='store_true', help='Also build edit_structure.json')
+    parser.add_argument('--with-llm', action='store_true', help='Also build edit_plan.json')
+    parser.add_argument('--with-render', action='store_true', help='Also render preview.mp4')
+    parser.add_argument('--interactive', action='store_true', help='Ask for title/telop overrides during the llm step')
     args = parser.parse_args()
 
-    from sceneflow.pipeline import candidates, meanings, representatives, scan, sceneify, structure, tagging
+    from sceneflow.pipeline import candidates, llm_plan, meanings, render, representatives, scan, sceneify, structure, tagging
 
     root = Path(args.root).resolve()
     if args.run_dir is None:
@@ -37,6 +40,8 @@ def main() -> int:
     tagging_out = run_dir / 'tagging' / 'scene_representatives_tagged.csv'
     candidates_out = run_dir / 'candidates' / 'scene_edit_candidates.json'
     meanings_out = run_dir / 'meaning' / 'scene_meanings.json'
+    structure_out = run_dir / 'structure' / 'edit_structure.json'
+    llm_out = run_dir / 'llm' / 'edit_plan.json'
 
     steps = [
         ('scan', scan.main, ['scan', '--root', str(root), '--run-dir', run_dir_str]),
@@ -46,10 +51,21 @@ def main() -> int:
         ('candidates', candidates.main, ['candidates', '--media-scene', str(sceneify_out), '--representatives', str(tagging_out), '--root', str(root), '--run-dir', run_dir_str]),
     ]
 
-    if args.with_meanings or args.with_structure:
+    with_llm = args.with_llm or args.with_render
+    with_structure = args.with_structure or with_llm
+    with_meanings = args.with_meanings or with_structure
+
+    if with_meanings:
         steps.append(('meanings', meanings.main, ['meanings', '--input', str(candidates_out), '--run-dir', run_dir_str]))
-    if args.with_structure:
+    if with_structure:
         steps.append(('structure', structure.main, ['structure', '--input', str(meanings_out), '--run-dir', run_dir_str]))
+    if with_llm:
+        llm_argv = ['llm', '--input', str(structure_out), '--run-dir', run_dir_str]
+        if args.interactive:
+            llm_argv.append('--interactive')
+        steps.append(('llm', llm_plan.main, llm_argv))
+    if args.with_render:
+        steps.append(('render', render.main, ['render', '--input', str(llm_out), '--root', str(root), '--run-dir', run_dir_str]))
 
     for _, step_main, argv in steps:
         code = _run_step(step_main, argv)

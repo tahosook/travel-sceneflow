@@ -41,11 +41,21 @@ UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_pipeline.py --
 UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_pipeline.py --root data/sample --run-dir outputs/sample-run --with-meanings --with-structure
 ```
 
+`edit_plan.json` と `preview.mp4` まで進めたい場合は、`--with-llm --with-render` を使います。  
+テロップやタイトルをその場で調整したいときは `--interactive` を付けると、`llm` step 中に質問が出ます。  
+この対話では、タイトルだけでなく「誰に見せる動画か」「どの scene を強く見せたいか」「テンポ感」「最後に残したい余韻」も指定できます。
+
+```bash
+UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_pipeline.py --root data/sample --run-dir outputs/sample-run --with-render --interactive
+```
+
 個別 step だけ確認したいときは `scripts/run_step.py` を使えます。
 
 ```bash
 UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_step.py scan --help
 UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_step.py candidates --help
+UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_step.py llm --help
+UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_step.py render --help
 ```
 
 ## 品質チェック

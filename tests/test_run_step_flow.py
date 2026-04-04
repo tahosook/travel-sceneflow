@@ -69,4 +69,9 @@ def test_run_step_pipeline_smoke(media_info_csv: Path, sample_root: Path, tmp_pa
     assert structure_payload["edit_sequence"][0]["start_at"] == "2024-05-01T09:00:00+09:00"
     assert len(llm_payload["plan"]["edit_sequence"][0]["preview_sources"]) == 3
     assert [card["title"] for card in llm_payload["plan"]["title_cards"]] == ["2024年5月1日", "旅の流れ", "旅の余韻"]
+    assert all(card["presentation"] == "overlay" for card in llm_payload["plan"]["title_cards"])
+    assert llm_payload["plan"]["editor_brief"]["caption_density"] == "standard"
+    assert llm_payload["plan"]["edit_sequence"][0]["base_planned_duration_seconds"] > 0
+    assert llm_payload["plan"]["subtitle_plan"]["enabled"] is True
+    assert len(llm_payload["plan"]["subtitle_plan"]["items"]) == 3
     assert llm_payload["plan"]["render_guidance"]["preferred_order"] == [1, 2, 3]
