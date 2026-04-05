@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from sceneflow.pipeline import tagging as tagging_pipeline
 from sceneflow.workflow_utils import log, resolve_output_path, summarize_elapsed, write_manifest
 
 
@@ -23,6 +24,10 @@ GENERAL_MAX_FOOD_RATIO = 0.25
 GOURMET_MAX_FOOD_RATIO = 0.4
 GENERAL_CONSECUTIVE_FOOD_PENALTY = 0.12
 GOURMET_CONSECUTIVE_FOOD_PENALTY = 0.06
+FOOD_SCENE_SAMPLE_LIMIT = 5
+FOOD_SCENE_MIN_SAMPLE_LIMIT = 3
+FOOD_SCENE_THRESHOLD = 0.6
+FOOD_SCENE_SINGLE_SAMPLE_THRESHOLD = 0.7
 
 TAG_STRENGTH = {
     "人物": "strong",
@@ -162,6 +167,13 @@ def parse_string_list(value: object) -> list[str]:
     if "," in text:
         return unique_strings([part.strip() for part in text.split(",")])
     return unique_strings([text])
+
+
+def normalized_asset_key(path_value: object) -> str:
+    if is_missing(path_value):
+        return ""
+    path = Path(str(path_value))
+    return tagging_pipeline.normalize_stem(path.stem)
 
 
 def haversine_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -307,6 +319,128 @@ def preview_source_indices(count: int, limit: int = PREVIEW_SOURCE_LIMIT) -> lis
     return indices
 
 
+def scene_sample_indices(count: int) -> list[int]:
+    if count <= 0:
+        return []
+    if count == 1:
+        return [0]
+    target = min(FOOD_SCENE_SAMPLE_LIMIT, count)
+    if count >= FOOD_SCENE_MIN_SAMPLE_LIMIT:
+        target = max(target, min(FOOD_SCENE_MIN_SAMPLE_LIMIT, count))
+
+    indices = {0, count - 1}
+    if count > 2:
+        indices.add(count // 2)
+
+    last_index = count - 1
+    while len(indices) < target:
+        for offset in range(target):
+            index = int(round(offset * last_index / max(target - 1, 1)))
+            indices.add(index)
+            if len(indices) >= target:
+                break
+        else:
+            break
+
+    return sorted(indices)
+
+
+def choose_scene_food_sample_rows(group: pd.DataFrame, rep: pd.Series | None) -> list[pd.Series]:
+    ordered = group.sort_values("final_timestamp_dt", kind="stable").reset_index(drop=True)
+    rows: list[pd.Series] = []
+    seen_keys: set[str] = set()
+    representative_path = None if rep is None else relpath(rep.get("representative_path"), Path("."))
+
+    preferred_indices: list[int] = []
+    if rep is not None:
+        rep_path_value = rep.get("representative_path")
+        for index, row in ordered.iterrows():
+            if str(row.get("path")) == str(rep_path_value):
+                preferred_indices.append(index)
+                break
+    preferred_indices.extend(scene_sample_indices(len(ordered)))
+
+    for index in preferred_indices:
+        if index < 0 or index >= len(ordered):
+            continue
+        row = ordered.iloc[index]
+        key = normalized_asset_key(row.get("path")) or str(row.get("path"))
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        rows.append(row)
+        if len(rows) >= FOOD_SCENE_SAMPLE_LIMIT:
+            break
+
+    if len(rows) < min(FOOD_SCENE_MIN_SAMPLE_LIMIT, len(ordered)):
+        image_rows = ordered[ordered["kind"].astype(str).str.lower().eq("image")]
+        for _, row in image_rows.iterrows():
+            key = normalized_asset_key(row.get("path")) or str(row.get("path"))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            rows.append(row)
+            if len(rows) >= FOOD_SCENE_SAMPLE_LIMIT:
+                break
+
+    return rows[:FOOD_SCENE_SAMPLE_LIMIT]
+
+
+def aggregate_food_samples(sample_confidences: list[float]) -> float:
+    if not sample_confidences:
+        return 0.0
+    ordered = sorted((clamp(value) for value in sample_confidences), reverse=True)
+    if len(ordered) == 1:
+        return round(ordered[0], 3)
+    return round(clamp(0.65 * ordered[0] + 0.35 * ordered[1]), 3)
+
+
+def analyze_scene_food(
+    group: pd.DataFrame,
+    rep: pd.Series | None,
+    root: Path,
+    image_index: dict[str, list[Path]],
+    cache_dir: Path,
+) -> dict[str, object]:
+    sample_rows = choose_scene_food_sample_rows(group, rep)
+    sample_confidences: list[float] = []
+    sample_paths: list[str] = []
+    evidence_count = 0
+
+    for row in sample_rows:
+        path_value = row.get("path")
+        if is_missing(path_value):
+            continue
+        path = Path(str(path_value))
+        if not path.exists():
+            continue
+        sample_paths.append(relpath(path, root) or str(path))
+        try:
+            analysis = tagging_pipeline.analyze_food_for_asset(
+                path,
+                row.get("kind"),
+                image_index,
+                cache_dir=cache_dir,
+            )
+        except Exception:
+            continue
+        confidence = float(analysis.get("food_confidence") or 0.0)
+        sample_confidences.append(confidence)
+        if confidence >= FOOD_SCENE_THRESHOLD:
+            evidence_count += 1
+
+    scene_food_confidence = aggregate_food_samples(sample_confidences)
+    threshold = FOOD_SCENE_SINGLE_SAMPLE_THRESHOLD if len(sample_confidences) <= 1 else FOOD_SCENE_THRESHOLD
+
+    return {
+        "food_confidence": scene_food_confidence,
+        "food_sample_count": len(sample_confidences),
+        "food_evidence_count": evidence_count,
+        "food_sample_paths": sample_paths,
+        "has_food_modifier": scene_food_confidence >= threshold,
+    }
+
+
 def build_preview_sources(group: pd.DataFrame, root: Path) -> list[dict[str, object]]:
     ordered = group.sort_values("final_timestamp_dt", kind="stable").reset_index(drop=True)
     rows: list[dict[str, object]] = []
@@ -430,6 +564,7 @@ def compute_scene_signals(
     group: pd.DataFrame,
     rep: pd.Series | None,
     gps_summary: dict[str, object],
+    scene_food: dict[str, object] | None = None,
 ) -> tuple[dict[str, float], list[str], dict[str, object]]:
     reasons: list[str] = []
     signals = {
@@ -448,6 +583,10 @@ def compute_scene_signals(
         "primary_type": "landscape",
         "modifiers": [],
         "food_confidence": 0.0,
+        "food_confidence_representative": 0.0,
+        "food_sample_count": 0,
+        "food_evidence_count": 0,
+        "food_sample_paths": [],
         "representative_tag": "風景",
         "tag_strength": "weak",
         "meaningful_tokens": [],
@@ -474,10 +613,7 @@ def compute_scene_signals(
 
     if rep is not None:
         raw_tag = normalize_tag(rep.get("tag"))
-        food_confidence = parse_float(rep.get("food_confidence")) or 0.0
-        modifiers = normalize_modifiers(rep.get("modifiers"), fallback_tag=raw_tag, food_confidence=food_confidence)
-        if "food" in modifiers and food_confidence <= 0.0:
-            food_confidence = 0.75
+        representative_food_confidence = parse_float(rep.get("food_confidence")) or 0.0
         primary_type = normalize_primary_type(rep.get("primary_type"), raw_tag)
         representative_tag = legacy_tag_for_primary_type(primary_type, raw_tag)
         strength = tag_strength(representative_tag)
@@ -536,9 +672,23 @@ def compute_scene_signals(
             signals["novelty_signal"] += min(0.10 + 0.03 * len(meaningful_tokens), 0.22)
             reasons.append("ocr")
 
-        if "food" in modifiers:
-            signals["food_signal"] = max(food_confidence, 0.35)
-            reasons.append("food_modifier")
+        scene_food = scene_food or {}
+        scene_food_confidence = float(scene_food.get("food_confidence") or 0.0)
+        food_sample_count = int(scene_food.get("food_sample_count") or 0)
+        food_evidence_count = int(scene_food.get("food_evidence_count") or 0)
+        food_sample_paths = list(scene_food.get("food_sample_paths") or [])
+        has_food_modifier = bool(scene_food.get("has_food_modifier"))
+        modifiers = normalize_modifiers([], food_confidence=scene_food_confidence if has_food_modifier else None)
+
+        if food_sample_count > 0:
+            reasons.append("food_scene_sampled")
+        if food_evidence_count > 0:
+            reasons.append(f"food_scene_evidence:{food_evidence_count}")
+        if has_food_modifier:
+            signals["food_signal"] = max(scene_food_confidence, 0.35)
+            reasons.append("food_modifier:scene")
+        elif representative_food_confidence >= FOOD_SCENE_THRESHOLD:
+            reasons.append("food_modifier:representative_only")
 
         if representative_tag == "風景" and not meaningful_tokens:
             signals["novelty_signal"] -= 0.08
@@ -547,7 +697,11 @@ def compute_scene_signals(
         scene_meta = {
             "primary_type": primary_type,
             "modifiers": modifiers,
-            "food_confidence": round(food_confidence, 3),
+            "food_confidence": round(scene_food_confidence, 3),
+            "food_confidence_representative": round(representative_food_confidence, 3),
+            "food_sample_count": food_sample_count,
+            "food_evidence_count": food_evidence_count,
+            "food_sample_paths": food_sample_paths,
             "representative_tag": representative_tag,
             "tag_strength": strength,
             "meaningful_tokens": meaningful_tokens,
@@ -697,6 +851,8 @@ def apply_selection_strategy(records: list[dict[str, object]]) -> None:
 
 def build_scene_records(media_scene: pd.DataFrame, reps: pd.DataFrame, root: Path) -> list[dict[str, object]]:
     records: list[dict[str, object]] = []
+    image_index = tagging_pipeline.build_image_index(root)
+    cache_dir = Path("outputs") / "ocr_cache"
 
     media_scene = media_scene.copy()
     media_scene["final_timestamp_dt"] = media_scene["final_timestamp"].map(parse_timestamp)
@@ -721,7 +877,8 @@ def build_scene_records(media_scene: pd.DataFrame, reps: pd.DataFrame, root: Pat
         rep_row = rep_match.iloc[0] if not rep_match.empty else None
 
         gps_summary = compute_gps_summary(group)
-        signals, selection_reasons, scene_meta = compute_scene_signals(group, rep_row, gps_summary)
+        scene_food = analyze_scene_food(group, rep_row, root, image_index, cache_dir)
+        signals, selection_reasons, scene_meta = compute_scene_signals(group, rep_row, gps_summary, scene_food=scene_food)
 
         video_count = int((group["kind"].astype(str).str.lower() == "video").sum())
         image_count = int((group["kind"].astype(str).str.lower() == "image").sum())
@@ -733,6 +890,10 @@ def build_scene_records(media_scene: pd.DataFrame, reps: pd.DataFrame, root: Pat
         modifiers = list(scene_meta.get("modifiers") or [])
         primary_type = str(scene_meta.get("primary_type") or "landscape")
         food_confidence = float(scene_meta.get("food_confidence") or 0.0)
+        representative_food_confidence = float(scene_meta.get("food_confidence_representative") or 0.0)
+        food_sample_count = int(scene_meta.get("food_sample_count") or 0)
+        food_evidence_count = int(scene_meta.get("food_evidence_count") or 0)
+        food_sample_paths = list(scene_meta.get("food_sample_paths") or [])
         max_gap_seconds = float(scene_meta.get("max_gap_seconds") or 0.0)
 
         scene_record: dict[str, object] = {
@@ -753,6 +914,10 @@ def build_scene_records(media_scene: pd.DataFrame, reps: pd.DataFrame, root: Pat
             "primary_type": primary_type,
             "modifiers": modifiers,
             "food_confidence": round(food_confidence, 3),
+            "food_confidence_representative": round(representative_food_confidence, 3),
+            "food_sample_count": food_sample_count,
+            "food_evidence_count": food_evidence_count,
+            "food_sample_paths": food_sample_paths,
             "selection_components": signals,
             "selection_score": None,
             "selection_rank": None,
@@ -778,6 +943,7 @@ def build_scene_records(media_scene: pd.DataFrame, reps: pd.DataFrame, root: Pat
                 "primary_type": primary_type,
                 "modifiers": modifiers,
                 "food_confidence": round(food_confidence, 3),
+                "food_confidence_representative": round(representative_food_confidence, 3),
                 "meaningful_ocr_token_count": len(tokens),
                 "meaningful_ocr_tokens": tokens,
                 "face_count_raw": None if is_missing(rep_row.get("face_count_raw")) else int(float(rep_row.get("face_count_raw"))),

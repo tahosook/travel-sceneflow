@@ -620,6 +620,37 @@ def compute_food_confidence(food_score: int, ocr_text: str) -> float:
     return round(max(0.0, min(confidence, 1.0)), 3)
 
 
+def analyze_food_for_asset(
+    path_value: object,
+    kind_value: object,
+    image_index: dict[str, list[Path]],
+    cache_dir: Path | None = None,
+) -> dict[str, object]:
+    raw_ocr_text, analysis_path, cleanup_paths, _ = ocr_text_for_asset(
+        path_value,
+        kind_value,
+        image_index,
+        cache_dir=cache_dir,
+    )
+    food_score = detect_food_score(analysis_path) if analysis_path is not None else 0
+    food_confidence = compute_food_confidence(food_score, raw_ocr_text)
+    cleaned_ocr_text = normalize_ocr_output(raw_ocr_text)
+    if len(cleaned_ocr_text) > 240:
+        cleaned_ocr_text = cleaned_ocr_text[:240]
+
+    for cleanup_path in cleanup_paths:
+        try:
+            cleanup_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    return {
+        "ocr_text": cleaned_ocr_text,
+        "food_score": food_score,
+        "food_confidence": food_confidence,
+    }
+
+
 def build_modifiers(food_confidence: float) -> list[str]:
     modifiers: list[str] = []
     if food_confidence >= FOOD_MODIFIER_THRESHOLD:

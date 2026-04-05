@@ -204,13 +204,37 @@ def test_food_modifier_does_not_become_primary_or_dominate(tmp_path: Path) -> No
         ],
     )
 
-    records = candidates.build_scene_records(scene_df, reps_df, tmp_path)
+    def fake_analyze_scene_food(group, rep, root, image_index, cache_dir):
+        scene_id = int(group.iloc[0]["scene_id"])
+        if scene_id == 1:
+            return {
+                "food_confidence": 0.92,
+                "food_sample_count": 4,
+                "food_evidence_count": 2,
+                "food_sample_paths": ["scene-1-0.jpg", "scene-1-1.jpg"],
+                "has_food_modifier": True,
+            }
+        return {
+            "food_confidence": 0.0,
+            "food_sample_count": 3,
+            "food_evidence_count": 0,
+            "food_sample_paths": [],
+            "has_food_modifier": False,
+        }
+
+    original = candidates.analyze_scene_food
+    candidates.analyze_scene_food = fake_analyze_scene_food
+    try:
+        records = candidates.build_scene_records(scene_df, reps_df, tmp_path)
+    finally:
+        candidates.analyze_scene_food = original
     food_scene = records[0]
     people_scene = records[1]
 
     assert food_scene["primary_type"] == "landscape"
     assert food_scene["representative_tag"] == "風景"
     assert food_scene["modifiers"] == ["food"]
+    assert food_scene["food_sample_count"] == 4
     assert food_scene["selection_score"] < people_scene["selection_score"]
     assert food_scene["selection_rank"] > people_scene["selection_rank"]
 
@@ -268,7 +292,30 @@ def test_food_quota_replaces_extra_food_scenes_in_general_trip(tmp_path: Path) -
     )
 
     scene_df, reps_df = build_synthetic_inputs(tmp_path, scene_specs)
-    records = candidates.build_scene_records(scene_df, reps_df, tmp_path)
+    def fake_analyze_scene_food(group, rep, root, image_index, cache_dir):
+        scene_id = int(group.iloc[0]["scene_id"])
+        if scene_id in {1, 2}:
+            return {
+                "food_confidence": 0.9,
+                "food_sample_count": 5,
+                "food_evidence_count": 2,
+                "food_sample_paths": [f"scene-{scene_id}-food.jpg"],
+                "has_food_modifier": True,
+            }
+        return {
+            "food_confidence": 0.0,
+            "food_sample_count": 3,
+            "food_evidence_count": 0,
+            "food_sample_paths": [],
+            "has_food_modifier": False,
+        }
+
+    original = candidates.analyze_scene_food
+    candidates.analyze_scene_food = fake_analyze_scene_food
+    try:
+        records = candidates.build_scene_records(scene_df, reps_df, tmp_path)
+    finally:
+        candidates.analyze_scene_food = original
     selected_records = [record for record in records if record["selected_for_edit"]]
     selected_food_records = [record for record in selected_records if "food" in record["modifiers"]]
 
@@ -311,7 +358,30 @@ def test_consecutive_food_scenes_receive_temporal_penalty(tmp_path: Path) -> Non
         ],
     )
 
-    records = candidates.build_scene_records(scene_df, reps_df, tmp_path)
+    def fake_analyze_scene_food(group, rep, root, image_index, cache_dir):
+        scene_id = int(group.iloc[0]["scene_id"])
+        if scene_id in {2, 3}:
+            return {
+                "food_confidence": 0.84,
+                "food_sample_count": 4,
+                "food_evidence_count": 2,
+                "food_sample_paths": [f"scene-{scene_id}-food.jpg"],
+                "has_food_modifier": True,
+            }
+        return {
+            "food_confidence": 0.0,
+            "food_sample_count": 3,
+            "food_evidence_count": 0,
+            "food_sample_paths": [],
+            "has_food_modifier": False,
+        }
+
+    original = candidates.analyze_scene_food
+    candidates.analyze_scene_food = fake_analyze_scene_food
+    try:
+        records = candidates.build_scene_records(scene_df, reps_df, tmp_path)
+    finally:
+        candidates.analyze_scene_food = original
     first_food = records[1]
     second_food = records[2]
 
@@ -376,8 +446,26 @@ def test_trip_type_adapts_food_quota_and_duration(tmp_path: Path) -> None:
     gourmet_scene_df, gourmet_reps_df = build_synthetic_inputs(tmp_path / "gourmet", build_trip_specs(9))
     general_scene_df, general_reps_df = build_synthetic_inputs(tmp_path / "general", build_trip_specs(4))
 
-    gourmet_records = candidates.build_scene_records(gourmet_scene_df, gourmet_reps_df, tmp_path)
-    general_records = candidates.build_scene_records(general_scene_df, general_reps_df, tmp_path)
+    def fake_analyze_scene_food(group, rep, root, image_index, cache_dir):
+        scene_id = int(group.iloc[0]["scene_id"])
+        scene_count = int(group["scene_id"].nunique())
+        del scene_count
+        is_food = float(rep.get("food_confidence") or 0.0) >= 0.9
+        return {
+            "food_confidence": 0.9 if is_food else 0.0,
+            "food_sample_count": 4 if is_food else 3,
+            "food_evidence_count": 2 if is_food else 0,
+            "food_sample_paths": [f"scene-{scene_id}-food.jpg"] if is_food else [],
+            "has_food_modifier": is_food,
+        }
+
+    original = candidates.analyze_scene_food
+    candidates.analyze_scene_food = fake_analyze_scene_food
+    try:
+        gourmet_records = candidates.build_scene_records(gourmet_scene_df, gourmet_reps_df, tmp_path)
+        general_records = candidates.build_scene_records(general_scene_df, general_reps_df, tmp_path)
+    finally:
+        candidates.analyze_scene_food = original
 
     gourmet_summary = candidates.build_payload_summary(gourmet_records)
     general_summary = candidates.build_payload_summary(general_records)
@@ -395,6 +483,35 @@ def test_trip_type_adapts_food_quota_and_duration(tmp_path: Path) -> None:
 
     assert gourmet_first_food["planned_duration_seconds"] > general_first_food["planned_duration_seconds"]
     assert general_first_food["planned_duration_seconds"] < general_last_non_food["planned_duration_seconds"]
+
+
+def test_scene_food_sampling_caps_and_deduplicates_rows(tmp_path: Path) -> None:
+    scene_df, _ = build_synthetic_inputs(
+        tmp_path,
+        [
+            {
+                "tag": "風景",
+                "primary_type": "landscape",
+                "asset_count": 8,
+                "blur_score": 1500.0,
+            }
+        ],
+    )
+    scene_df.loc[1, "path"] = scene_df.loc[0, "path"]
+    scene_df.loc[2, "path"] = scene_df.loc[0, "path"]
+    group = scene_df.copy()
+    group["final_timestamp_dt"] = group["final_timestamp"].map(pd.Timestamp)
+
+    rows = candidates.choose_scene_food_sample_rows(group, None)
+    keys = [candidates.normalized_asset_key(row.get("path")) for row in rows]
+
+    assert len(rows) <= candidates.FOOD_SCENE_SAMPLE_LIMIT
+    assert len(keys) == len(set(keys))
+
+
+def test_scene_food_aggregation_uses_top_two_without_dilution() -> None:
+    assert candidates.aggregate_food_samples([0.95, 0.7, 0.05, 0.0]) == 0.862
+    assert candidates.aggregate_food_samples([0.4, 0.35, 0.3]) < candidates.FOOD_SCENE_THRESHOLD
 
 
 def test_editor_brief_updates_sequence_and_subtitle_density(media_info_csv: Path, sample_root: Path) -> None:
