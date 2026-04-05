@@ -58,6 +58,21 @@ OCR_TARGET_WIDTH = 1280
 OCR_CENTER_CROP_RATIO = 0.5
 OCR_POOL_WORKERS = 4
 OCR_CACHE_VERSION = "v3-resize1280-crop50-pool4"
+FOOD_MODIFIER_THRESHOLD = 0.7
+
+PRIMARY_TYPE_TO_TAG = {
+    "people": "人物",
+    "group": "集合写真",
+    "station": "駅",
+    "temple": "寺社",
+    "building": "建物",
+    "landscape": "風景",
+    "night": "夜景",
+    "transit": "移動",
+}
+TAG_TO_PRIMARY_TYPE = {tag: primary_type for primary_type, tag in PRIMARY_TYPE_TO_TAG.items()}
+PRIMARY_OCR_RULES = [(tag, keywords) for tag, keywords in OCR_RULES if tag != "食事"]
+FOOD_OCR_KEYWORDS = next((keywords for tag, keywords in OCR_RULES if tag == "食事"), [])
 
 
 def is_missing(value: object) -> bool:
@@ -526,13 +541,13 @@ def ocr_text_for_asset(
     return analyze_image_for_ocr(path, cache_dir)
 
 
-def score_ocr_text(text: str) -> tuple[int, str | None]:
+def score_tag_candidates(text: str, rules: list[tuple[str, list[tuple[str, int]]]]) -> list[tuple[str, int, str]]:
     normalized = normalize_for_match(text)
     if not normalized:
-        return 0, None
+        return []
 
     scores: list[tuple[str, int, str]] = []
-    for tag, keywords in OCR_RULES:
+    for tag, keywords in rules:
         score = 0
         matched = ""
         for keyword, weight in keywords:
@@ -544,37 +559,23 @@ def score_ocr_text(text: str) -> tuple[int, str | None]:
         if score > 0:
             scores.append((tag, score, matched))
 
+    scores.sort(key=lambda item: (-item[1], TAG_ORDER.index(item[0]) if item[0] in TAG_ORDER else len(TAG_ORDER)))
+    return scores
+
+
+def score_ocr_text(text: str) -> tuple[int, str | None]:
+    scores = score_tag_candidates(text, OCR_RULES)
     if not scores:
         return 0, None
-
-    scores.sort(key=lambda item: (-item[1], TAG_ORDER.index(item[0]) if item[0] in TAG_ORDER else len(TAG_ORDER)))
     return scores[0][1], scores[0][2] or None
 
 
-def infer_tag_from_ocr(ocr_text: str) -> tuple[str | None, bool, str | None]:
+def infer_primary_tag_from_ocr(ocr_text: str) -> tuple[str | None, bool, str | None]:
     text = normalize_ocr_output(ocr_text)
-    score, matched = score_ocr_text(text)
-    if score == 0:
-        return None, False, None
-
-    normalized = normalize_for_match(text)
-    candidates: list[tuple[str, int, str]] = []
-    for tag, keywords in OCR_RULES:
-        tag_score = 0
-        tag_match = ""
-        for keyword, weight in keywords:
-            norm_keyword = normalize_for_match(keyword)
-            if norm_keyword and norm_keyword in normalized:
-                tag_score += weight
-                if not tag_match:
-                    tag_match = keyword
-        if tag_score > 0:
-            candidates.append((tag, tag_score, tag_match))
-
+    candidates = score_tag_candidates(text, PRIMARY_OCR_RULES)
     if not candidates:
         return None, False, None
 
-    candidates.sort(key=lambda item: (-item[1], TAG_ORDER.index(item[0]) if item[0] in TAG_ORDER else len(TAG_ORDER)))
     tag, tag_score, tag_match = candidates[0]
     return tag, tag_score >= 4, tag_match
 
@@ -591,29 +592,74 @@ def infer_tag_from_time(timestamp_value: object) -> str:
     return "夜景" if day_or_night(timestamp_value) == "night" else "風景"
 
 
-def choose_tag(row: pd.Series, ocr_text: str, face_count_filtered: int, food_score: int) -> tuple[str, str, str | None]:
-    ocr_tag, ocr_strong, ocr_match = infer_tag_from_ocr(ocr_text)
+def normalize_primary_type(tag: str | None) -> str:
+    if tag is None:
+        return "landscape"
+    return TAG_TO_PRIMARY_TYPE.get(tag, "landscape")
+
+
+def food_ocr_score(ocr_text: str) -> int:
+    normalized = normalize_for_match(normalize_ocr_output(ocr_text))
+    if not normalized:
+        return 0
+
+    score = 0
+    for keyword, weight in FOOD_OCR_KEYWORDS:
+        norm_keyword = normalize_for_match(keyword)
+        if norm_keyword and norm_keyword in normalized:
+            score += weight
+    return score
+
+
+def compute_food_confidence(food_score: int, ocr_text: str) -> float:
+    # Keep food as a conservative modifier: circle-heavy images alone should
+    # not dominate classification without at least some corroborating signal.
+    geometric_signal = min(max(food_score, 0), 4) / 4.0
+    ocr_signal = min(food_ocr_score(ocr_text), 6) / 6.0
+    confidence = 0.65 * geometric_signal + 0.35 * ocr_signal
+    return round(max(0.0, min(confidence, 1.0)), 3)
+
+
+def build_modifiers(food_confidence: float) -> list[str]:
+    modifiers: list[str] = []
+    if food_confidence >= FOOD_MODIFIER_THRESHOLD:
+        modifiers.append("food")
+    return modifiers
+
+
+def classify_scene_attributes(
+    row: pd.Series,
+    ocr_text: str,
+    face_count_filtered: int,
+    food_confidence: float,
+) -> tuple[str, str, list[str], str, str | None]:
+    modifiers = build_modifiers(food_confidence)
+    ocr_tag, ocr_strong, ocr_match = infer_primary_tag_from_ocr(ocr_text)
     if ocr_tag and ocr_strong:
-        return ocr_tag, "ocr", ocr_match
+        return ocr_tag, normalize_primary_type(ocr_tag), modifiers, "ocr", ocr_match
 
     face_tag = infer_tag_from_face(face_count_filtered)
     if face_tag:
-        return face_tag, "face", None
+        return face_tag, normalize_primary_type(face_tag), modifiers, "face", None
 
-    # Food detection is intentionally conservative here.
-    # The heuristic is useful as a weak hint, but we avoid letting a noisy local
-    # detector override the broader scene flow unless the signal is very strong.
-    if food_score >= 4:
-        return "食事", "food", None
-
-    return infer_tag_from_time(row["representative_final_timestamp"]), "time", None
+    time_tag = infer_tag_from_time(row["representative_final_timestamp"])
+    return time_tag, normalize_primary_type(time_tag), modifiers, "time", None
 
 
-def build_caption(tag: str, source: str, ocr_match: str | None, face_count_filtered: int, timestamp_value: object) -> str:
+def build_caption(
+    tag: str,
+    source: str,
+    ocr_match: str | None,
+    face_count_filtered: int,
+    timestamp_value: object,
+    modifiers: list[str] | None = None,
+) -> str:
     time_label = "昼" if day_or_night(timestamp_value) == "day" else "夜"
+    modifiers = modifiers or []
+    has_food = "food" in modifiers
 
     if source == "ocr":
-        if tag in {"駅", "寺社", "食事", "建物", "移動"}:
+        if tag in {"駅", "寺社", "建物", "移動"}:
             if ocr_match:
                 return f"{ocr_match}が見える一枚です。"
             return TAG_CAPTIONS.get(tag, f"{time_label}の様子が伝わる一枚です。")
@@ -631,10 +677,10 @@ def build_caption(tag: str, source: str, ocr_match: str | None, face_count_filte
             return f"{face_count_filtered}人ほど写る集合写真です。"
         return "人物が写る一枚です。"
 
-    if source == "food":
-        if ocr_match:
-            return f"{ocr_match}が並ぶ食事の一枚です。"
-        return "食事の様子が伝わる一枚です。"
+    if has_food and tag == "夜景":
+        return "夜の食事を含む旅の一枚です。"
+    if has_food and tag == "風景":
+        return "食事を含む旅の雰囲気が伝わる一枚です。"
 
     if tag == "夜景":
         return f"{time_label}の景色が印象的な一枚です。"
@@ -646,8 +692,6 @@ def build_caption(tag: str, source: str, ocr_match: str | None, face_count_filte
         return "駅の様子が伝わる一枚です。"
     if tag == "寺社":
         return "寺社の雰囲気が伝わる一枚です。"
-    if tag == "食事":
-        return "食事の記録が残る一枚です。"
     if tag == "建物":
         return "建物の様子がわかる一枚です。"
     if tag == "人物":
@@ -669,9 +713,10 @@ def process_representative_row(item: tuple[int, dict[str, object]]) -> dict[str,
     )
     face_count_raw, face_count_filtered = detect_face_counts(analysis_path) if analysis_path is not None else (0, 0)
     food_score = detect_food_score(analysis_path) if analysis_path is not None else 0
+    food_confidence = compute_food_confidence(food_score, raw_ocr_text)
     row = pd.Series(row_data)
-    tag, source, ocr_match = choose_tag(row, raw_ocr_text, face_count_filtered, food_score)
-    caption = build_caption(tag, source, ocr_match, face_count_filtered, row_data["representative_final_timestamp"])
+    tag, primary_type, modifiers, source, ocr_match = classify_scene_attributes(row, raw_ocr_text, face_count_filtered, food_confidence)
+    caption = build_caption(tag, source, ocr_match, face_count_filtered, row_data["representative_final_timestamp"], modifiers)
 
     cleaned_ocr_text = normalize_ocr_output(raw_ocr_text)
     if len(cleaned_ocr_text) > 240:
@@ -698,6 +743,9 @@ def process_representative_row(item: tuple[int, dict[str, object]]) -> dict[str,
         "face_count_filtered": face_count_filtered,
         "face_count": face_count_filtered,
         "tag": tag,
+        "primary_type": primary_type,
+        "modifiers": modifiers,
+        "food_confidence": food_confidence,
         "caption": caption,
         "_row_index": row_index,
     }
@@ -751,6 +799,9 @@ def annotate_representatives(
     face_counts_filtered = [int(row["face_count_filtered"]) for row in results]
     face_counts_alias = [int(row["face_count"]) for row in results]
     tags = [row["tag"] for row in results]
+    primary_types = [row["primary_type"] for row in results]
+    modifiers = [row["modifiers"] for row in results]
+    food_confidences = [row["food_confidence"] for row in results]
     captions = [row["caption"] for row in results]
 
     if reporter is not None:
@@ -761,6 +812,9 @@ def annotate_representatives(
     df["face_count_filtered"] = face_counts_filtered
     df["face_count"] = face_counts_alias
     df["tag"] = tags
+    df["primary_type"] = primary_types
+    df["modifiers"] = modifiers
+    df["food_confidence"] = food_confidences
     df["caption"] = captions
     return df
 

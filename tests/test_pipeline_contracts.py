@@ -3,8 +3,77 @@ from __future__ import annotations
 import io
 from pathlib import Path
 
+import pandas as pd
+
 from sceneflow.pipeline import candidates, llm_plan, meanings, render, representatives, sceneify, structure
 from tests.helpers import build_tagged_representatives
+
+
+CAPTION_BY_TAG = {
+    "風景": "風景の広がりが伝わる一枚です。",
+    "移動": "移動中の様子を捉えた一枚です。",
+    "寺社": "寺社の雰囲気が伝わる一枚です。",
+    "人物": "人物が写る一枚です。",
+    "集合写真": "集合写真の一枚です。",
+    "駅": "駅の様子が伝わる一枚です。",
+    "建物": "建物の様子がわかる一枚です。",
+    "夜景": "夜の景色が印象的な一枚です。",
+}
+
+
+def build_synthetic_inputs(tmp_path: Path, scene_specs: list[dict[str, object]]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    media_rows: list[dict[str, object]] = []
+    representative_rows: list[dict[str, object]] = []
+    base_time = pd.Timestamp("2024-05-01T09:00:00+09:00")
+
+    for scene_id, spec in enumerate(scene_specs, start=1):
+        asset_count = int(spec.get("asset_count", 2))
+        asset_kind = str(spec.get("kind", "image"))
+        representative_kind = str(spec.get("representative_kind", asset_kind))
+        scene_start = base_time + pd.Timedelta(minutes=(scene_id - 1) * 5)
+        rep_extension = ".mp4" if representative_kind == "video" else ".jpg"
+        representative_path = tmp_path / f"scene-{scene_id}{rep_extension}"
+
+        for asset_index in range(asset_count):
+            current_kind = representative_kind if asset_index == asset_count - 1 else asset_kind
+            extension = ".mp4" if current_kind == "video" else ".jpg"
+            media_rows.append(
+                {
+                    "scene_id": scene_id,
+                    "path": str(tmp_path / f"scene-{scene_id}-{asset_index}{extension}"),
+                    "kind": current_kind,
+                    "final_timestamp": (scene_start + pd.Timedelta(seconds=asset_index * 18)).isoformat(),
+                    "duration_seconds": float(spec.get("clip_duration_seconds", 6.0 if current_kind == "video" else 0.0)),
+                    "gps_latitude": spec.get("gps_latitude"),
+                    "gps_longitude": spec.get("gps_longitude"),
+                    "model": spec.get("model", "camera"),
+                }
+            )
+
+        tag = str(spec.get("tag", "風景"))
+        representative_rows.append(
+            {
+                "scene_id": scene_id,
+                "representative_path": str(representative_path),
+                "representative_kind": representative_kind,
+                "representative_final_timestamp": scene_start.isoformat(),
+                "representative_laplacian": float(spec.get("blur_score", 2500.0)),
+                "representative_brightness": float(spec.get("brightness", 128.0)),
+                "representative_duration_seconds": float(spec.get("representative_duration_seconds", 6.0 if representative_kind == "video" else 0.0)),
+                "representative_has_audio": bool(spec.get("representative_has_audio", representative_kind == "video")),
+                "ocr_text": str(spec.get("ocr_text", "")),
+                "face_count_raw": int(spec.get("face_count", 0)),
+                "face_count_filtered": int(spec.get("face_count", 0)),
+                "face_count": int(spec.get("face_count", 0)),
+                "tag": tag,
+                "primary_type": str(spec.get("primary_type", "landscape")),
+                "modifiers": list(spec.get("modifiers", [])),
+                "food_confidence": float(spec.get("food_confidence", 0.0)),
+                "caption": str(spec.get("caption", CAPTION_BY_TAG.get(tag, "旅の一枚です。"))),
+            }
+        )
+
+    return pd.DataFrame(media_rows), pd.DataFrame(representative_rows)
 
 
 def test_sceneify_and_representatives_contracts(media_info_csv: Path) -> None:
@@ -101,6 +170,231 @@ def test_candidates_to_llm_contracts(media_info_csv: Path, sample_root: Path) ->
     assert draft_plan["render_guidance"]["title_overlay_mode"] == "overlay"
     assert draft_plan["render_guidance"]["caption_density"] == "standard"
     assert "自然で見やすい動画の構成案" in prompt_text
+
+
+def test_food_modifier_does_not_become_primary_or_dominate(tmp_path: Path) -> None:
+    scene_df, reps_df = build_synthetic_inputs(
+        tmp_path,
+        [
+            {
+                "tag": "風景",
+                "primary_type": "landscape",
+                "modifiers": ["food"],
+                "food_confidence": 0.92,
+                "asset_count": 2,
+                "blur_score": 1500.0,
+            },
+            {
+                "tag": "人物",
+                "primary_type": "people",
+                "face_count": 3,
+                "asset_count": 4,
+                "kind": "video",
+                "representative_kind": "video",
+                "representative_duration_seconds": 5.0,
+                "blur_score": 3200.0,
+            },
+            {
+                "tag": "寺社",
+                "primary_type": "temple",
+                "asset_count": 3,
+                "blur_score": 2800.0,
+                "ocr_text": "temple",
+            },
+        ],
+    )
+
+    records = candidates.build_scene_records(scene_df, reps_df, tmp_path)
+    food_scene = records[0]
+    people_scene = records[1]
+
+    assert food_scene["primary_type"] == "landscape"
+    assert food_scene["representative_tag"] == "風景"
+    assert food_scene["modifiers"] == ["food"]
+    assert food_scene["selection_score"] < people_scene["selection_score"]
+    assert food_scene["selection_rank"] > people_scene["selection_rank"]
+
+
+def test_food_quota_replaces_extra_food_scenes_in_general_trip(tmp_path: Path) -> None:
+    scene_specs = [
+        {
+            "tag": "風景",
+            "primary_type": "landscape",
+            "modifiers": ["food"],
+            "food_confidence": 0.95,
+            "asset_count": 6,
+            "kind": "video",
+            "representative_kind": "video",
+            "representative_duration_seconds": 4.5,
+            "blur_score": 3900.0,
+        },
+        {
+            "tag": "風景",
+            "primary_type": "landscape",
+            "modifiers": ["food"],
+            "food_confidence": 0.91,
+            "asset_count": 5,
+            "kind": "video",
+            "representative_kind": "video",
+            "representative_duration_seconds": 5.0,
+            "blur_score": 3600.0,
+        },
+        {
+            "tag": "人物",
+            "primary_type": "people",
+            "face_count": 2,
+            "asset_count": 4,
+            "kind": "video",
+            "representative_kind": "video",
+            "representative_duration_seconds": 5.0,
+            "blur_score": 3100.0,
+        },
+        {
+            "tag": "寺社",
+            "primary_type": "temple",
+            "asset_count": 3,
+            "blur_score": 2800.0,
+            "ocr_text": "temple",
+        },
+    ]
+    scene_specs.extend(
+        {
+            "tag": "風景",
+            "primary_type": "landscape",
+            "asset_count": 1,
+            "blur_score": 1200.0,
+        }
+        for _ in range(6)
+    )
+
+    scene_df, reps_df = build_synthetic_inputs(tmp_path, scene_specs)
+    records = candidates.build_scene_records(scene_df, reps_df, tmp_path)
+    selected_records = [record for record in records if record["selected_for_edit"]]
+    selected_food_records = [record for record in selected_records if "food" in record["modifiers"]]
+
+    assert len(selected_records) == 3
+    assert len(selected_food_records) == 1
+    assert {record["scene_id"] for record in selected_records} >= {3, 4}
+    assert any("quota_promoted" in record["selection_reasons"] for record in selected_records)
+    assert any("quota_replaced" in record["selection_reasons"] for record in records if "food" in record["modifiers"])
+
+
+def test_consecutive_food_scenes_receive_temporal_penalty(tmp_path: Path) -> None:
+    scene_df, reps_df = build_synthetic_inputs(
+        tmp_path,
+        [
+            {"tag": "風景", "primary_type": "landscape", "asset_count": 2, "blur_score": 2200.0},
+            {
+                "tag": "風景",
+                "primary_type": "landscape",
+                "modifiers": ["food"],
+                "food_confidence": 0.84,
+                "asset_count": 3,
+                "kind": "video",
+                "representative_kind": "video",
+                "representative_duration_seconds": 5.0,
+                "blur_score": 2900.0,
+            },
+            {
+                "tag": "風景",
+                "primary_type": "landscape",
+                "modifiers": ["food"],
+                "food_confidence": 0.84,
+                "asset_count": 3,
+                "kind": "video",
+                "representative_kind": "video",
+                "representative_duration_seconds": 5.0,
+                "blur_score": 2900.0,
+            },
+            {"tag": "人物", "primary_type": "people", "face_count": 2, "asset_count": 3, "blur_score": 3000.0},
+            {"tag": "寺社", "primary_type": "temple", "asset_count": 2, "blur_score": 2400.0, "ocr_text": "temple"},
+        ],
+    )
+
+    records = candidates.build_scene_records(scene_df, reps_df, tmp_path)
+    first_food = records[1]
+    second_food = records[2]
+
+    assert first_food["selection_score"] > second_food["selection_score"]
+    assert "food_penalty:consecutive" in second_food["selection_reasons"]
+
+
+def test_trip_type_adapts_food_quota_and_duration(tmp_path: Path) -> None:
+    def build_trip_specs(food_scene_count: int) -> list[dict[str, object]]:
+        specs: list[dict[str, object]] = []
+        for index in range(20):
+            if index < food_scene_count:
+                specs.append(
+                    {
+                        "tag": "風景",
+                        "primary_type": "landscape",
+                        "modifiers": ["food"],
+                        "food_confidence": 0.9,
+                        "asset_count": 6,
+                        "kind": "video",
+                        "representative_kind": "video",
+                        "representative_duration_seconds": 5.0,
+                        "blur_score": 3800.0,
+                    }
+                )
+            elif index == 19:
+                specs.append(
+                    {
+                        "tag": "風景",
+                        "primary_type": "landscape",
+                        "asset_count": 6,
+                        "kind": "video",
+                        "representative_kind": "video",
+                        "representative_duration_seconds": 5.0,
+                        "blur_score": 3800.0,
+                    }
+                )
+            elif index == 10:
+                specs.append(
+                    {
+                        "tag": "人物",
+                        "primary_type": "people",
+                        "face_count": 2,
+                        "asset_count": 4,
+                        "kind": "video",
+                        "representative_kind": "video",
+                        "representative_duration_seconds": 5.0,
+                        "blur_score": 3000.0,
+                    }
+                )
+            else:
+                specs.append(
+                    {
+                        "tag": "風景",
+                        "primary_type": "landscape",
+                        "asset_count": 1,
+                        "blur_score": 1400.0,
+                    }
+                )
+        return specs
+
+    gourmet_scene_df, gourmet_reps_df = build_synthetic_inputs(tmp_path / "gourmet", build_trip_specs(9))
+    general_scene_df, general_reps_df = build_synthetic_inputs(tmp_path / "general", build_trip_specs(4))
+
+    gourmet_records = candidates.build_scene_records(gourmet_scene_df, gourmet_reps_df, tmp_path)
+    general_records = candidates.build_scene_records(general_scene_df, general_reps_df, tmp_path)
+
+    gourmet_summary = candidates.build_payload_summary(gourmet_records)
+    general_summary = candidates.build_payload_summary(general_records)
+
+    assert gourmet_summary["trip_type"] == "gourmet"
+    assert general_summary["trip_type"] == "general"
+    assert gourmet_summary["selected_food_scene_count"] > general_summary["selected_food_scene_count"]
+
+    gourmet_structure = structure.build_structure(meanings.build_meanings({"generated_at": "2026-03-29T11:00:00+09:00", "scenes": gourmet_records}))
+    general_structure = structure.build_structure(meanings.build_meanings({"generated_at": "2026-03-29T11:00:00+09:00", "scenes": general_records}))
+
+    gourmet_first_food = next(item for item in gourmet_structure["edit_sequence"] if item["scene_id"] == 1)
+    general_first_food = next(item for item in general_structure["edit_sequence"] if item["scene_id"] == 1)
+    general_last_non_food = next(item for item in general_structure["edit_sequence"] if item["scene_id"] == 20)
+
+    assert gourmet_first_food["planned_duration_seconds"] > general_first_food["planned_duration_seconds"]
+    assert general_first_food["planned_duration_seconds"] < general_last_non_food["planned_duration_seconds"]
 
 
 def test_editor_brief_updates_sequence_and_subtitle_density(media_info_csv: Path, sample_root: Path) -> None:

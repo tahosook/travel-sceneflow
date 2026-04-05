@@ -29,6 +29,14 @@ def parse_float(value: object) -> float | None:
         return None
 
 
+def normalize_modifiers(value: object) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if not is_missing(item)]
+    if is_missing(value):
+        return []
+    return [part.strip() for part in str(value).split(",") if part.strip()]
+
+
 def load_meanings(path: Path) -> dict[str, object]:
     if not path.exists():
         raise FileNotFoundError(f"Missing input JSON: {path}")
@@ -62,13 +70,20 @@ def chapter_pace(chapter_id: str) -> str:
     }.get(chapter_id, "一定")
 
 
-def render_duration_hint(duration_seconds: object, edit_action: str) -> float:
+def render_duration_hint(duration_seconds: object, edit_action: str, modifiers: object = None, trip_type: object = None) -> float:
     value = parse_float(duration_seconds) or 0.0
     if edit_action == "optional":
-        return min(max(value * 0.6, 1.0), 1.8)
-    if edit_action == "support":
-        return min(max(value * 0.8, 1.2), 2.4)
-    return min(max(value, 1.8), 3.5)
+        base_duration = min(max(value * 0.6, 1.0), 1.8)
+    elif edit_action == "support":
+        base_duration = min(max(value * 0.8, 1.2), 2.4)
+    else:
+        base_duration = min(max(value, 1.8), 3.5)
+
+    modifiers_list = normalize_modifiers(modifiers)
+    if "food" in modifiers_list:
+        multiplier = 0.85 if str(trip_type or "general") == "gourmet" else 0.7
+        base_duration *= multiplier
+    return max(0.8, round(base_duration, 2))
 
 
 def assign_chapter(index: int, total: int, opening_end: int, closing_start: int) -> str:
@@ -84,11 +99,14 @@ def build_sequence_item(scene: dict[str, object], index: int, total: int, openin
     edit_action = str(scene.get("edit_action") or "keep")
     role = str(scene.get("role") or "flow")
     priority = str(scene.get("priority_band") or "low")
-    duration_hint = render_duration_hint(scene.get("duration_seconds"), edit_action)
+    modifiers = normalize_modifiers(scene.get("modifiers"))
+    trip_type = str(scene.get("trip_type") or "general")
+    duration_hint = render_duration_hint(scene.get("duration_seconds"), edit_action, modifiers, trip_type)
     transition_hint = "fade_in" if index == 0 else "fade_out" if index == total - 1 else "cut"
     if chapter_id == "body" and role == "transition":
         transition_hint = "soft_cut"
     representative = scene.get("representative") if isinstance(scene.get("representative"), dict) else {}
+    include = bool(scene.get("selected_for_edit")) or chapter_id in {"opening", "closing"}
 
     return {
         "order": index + 1,
@@ -99,7 +117,14 @@ def build_sequence_item(scene: dict[str, object], index: int, total: int, openin
         "role": role,
         "edit_action": edit_action,
         "priority_band": priority,
-        "include": True,
+        "include": include,
+        "selected_for_edit": bool(scene.get("selected_for_edit")),
+        "selection_rank": scene.get("selection_rank"),
+        "selection_score": scene.get("selection_score"),
+        "primary_type": scene.get("primary_type"),
+        "modifiers": modifiers,
+        "food_confidence": scene.get("food_confidence"),
+        "trip_type": trip_type,
         "transition_hint": transition_hint,
         "planned_duration_seconds": round(duration_hint, 2),
         "summary": scene.get("summary"),
@@ -117,6 +142,7 @@ def build_chapter(chapter_id: str, scenes: list[dict[str, object]]) -> dict[str,
     role_counts: dict[str, int] = {}
     priority_counts: dict[str, int] = {}
     total_duration = 0.0
+    selected_scene_count = 0
     for scene in scenes:
         tag = str(scene.get("representative_tag") or "未判定")
         role = str(scene.get("role") or "flow")
@@ -126,9 +152,15 @@ def build_chapter(chapter_id: str, scenes: list[dict[str, object]]) -> dict[str,
         tag_counts[tag] = tag_counts.get(tag, 0) + 1
         role_counts[role] = role_counts.get(role, 0) + 1
         priority_counts[priority] = priority_counts.get(priority, 0) + 1
+        if bool(scene.get("selected_for_edit")):
+            selected_scene_count += 1
 
     scene_ids = [scene.get("scene_id") for scene in scenes]
-    anchors = [scene.get("scene_id") for scene in scenes if str(scene.get("priority_band") or "low") != "low"]
+    anchors = [
+        scene.get("scene_id")
+        for scene in scenes
+        if bool(scene.get("selected_for_edit")) or str(scene.get("priority_band") or "low") != "low"
+    ]
     return {
         "chapter_id": chapter_id,
         "title": chapter_title(chapter_id),
@@ -137,6 +169,7 @@ def build_chapter(chapter_id: str, scenes: list[dict[str, object]]) -> dict[str,
         "scene_ids": scene_ids,
         "anchor_scene_ids": anchors,
         "scene_count": len(scenes),
+        "selected_scene_count": selected_scene_count,
         "estimated_duration_seconds": round(total_duration, 2),
         "tag_counts": dict(sorted(tag_counts.items(), key=lambda item: (-item[1], item[0]))),
         "role_counts": dict(sorted(role_counts.items())),
@@ -169,6 +202,8 @@ def build_structure(meanings: dict[str, object]) -> dict[str, object]:
         "opening_count": len(opening_scenes),
         "body_count": len(body_scenes),
         "closing_count": len(closing_scenes),
+        "selected_scene_count": sum(1 for scene in scenes if bool(scene.get("selected_for_edit"))),
+        "trip_type": meanings.get("summary", {}).get("trip_type", "general"),
         "sequence_length_seconds": round(sum(item["planned_duration_seconds"] for item in sequence), 2),
         "priority_counts": meanings.get("summary", {}).get("priority_counts", {}),
     }

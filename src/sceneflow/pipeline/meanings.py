@@ -13,7 +13,7 @@ DEFAULT_INPUT = "scene_edit_candidates.json"
 DEFAULT_OUTPUT = "scene_meanings.json"
 
 OPENING_TAGS = {"風景", "夜景"}
-HIGHLIGHT_TAGS = {"食事", "寺社", "人物", "集合写真", "駅"}
+HIGHLIGHT_TAGS = {"寺社", "人物", "集合写真", "駅"}
 TRANSITION_TAGS = {"移動", "駅"}
 SUPPORT_TAGS = {"風景", "建物"}
 
@@ -32,6 +32,14 @@ def parse_float(value: object) -> float | None:
         return float(value)
     except Exception:
         return None
+
+
+def normalize_modifiers(value: object) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if not is_missing(item)]
+    if is_missing(value):
+        return []
+    return [part.strip() for part in str(value).split(",") if part.strip()]
 
 
 def format_duration_label(seconds: object) -> str:
@@ -60,6 +68,10 @@ def build_scene_summary(scene: dict[str, object]) -> str:
     if isinstance(asset_count, int):
         parts.append(f"{asset_count}素材")
 
+    modifiers = normalize_modifiers(scene.get("modifiers"))
+    if "food" in modifiers:
+        parts.append("食事あり")
+
     gps = scene.get("gps") if isinstance(scene.get("gps"), dict) else {}
     if gps.get("has_gps"):
         parts.append("GPSあり")
@@ -76,6 +88,7 @@ def classify_role(scene: dict[str, object], index: int, total: int) -> str:
     tag = str(scene.get("representative_tag") or "")
     priority = str(scene.get("priority_band") or "low")
     importance = parse_float(scene.get("importance_score")) or 0.0
+    selected_for_edit = bool(scene.get("selected_for_edit"))
     opening_count, closing_count = scene_band_counts(total)
 
     if index < opening_count:
@@ -84,6 +97,10 @@ def classify_role(scene: dict[str, object], index: int, total: int) -> str:
         return "closing"
     if tag in TRANSITION_TAGS:
         return "transition"
+    if not selected_for_edit:
+        if tag in SUPPORT_TAGS or priority == "low":
+            return "support"
+        return "flow"
     if tag in HIGHLIGHT_TAGS:
         return "highlight"
     if tag in OPENING_TAGS and priority != "low":
@@ -95,23 +112,28 @@ def classify_role(scene: dict[str, object], index: int, total: int) -> str:
     return "flow"
 
 
-def classify_action(role: str, priority_band: str) -> str:
-    if role in {"opening", "closing", "highlight"}:
+def classify_action(role: str, priority_band: str, selected_for_edit: bool) -> str:
+    if role in {"opening", "closing"}:
+        return "keep"
+    if not selected_for_edit:
+        return "optional"
+    if role == "highlight":
         return "keep"
     if role in {"transition", "establishing", "flow"}:
         return "keep"
     if priority_band == "low":
-        return "optional"
+        return "support"
     return "support"
 
 
 def build_scene_record(scene: dict[str, object], index: int, total: int) -> dict[str, object]:
     role = classify_role(scene, index, total)
     priority_band = str(scene.get("priority_band") or "low")
-    action = classify_action(role, priority_band)
+    selected_for_edit = bool(scene.get("selected_for_edit"))
+    action = classify_action(role, priority_band, selected_for_edit)
     summary = build_scene_summary(scene)
     rep = scene.get("representative") if isinstance(scene.get("representative"), dict) else {}
-    reasons = list(scene.get("importance_reasons") or [])
+    reasons = list(scene.get("selection_reasons") or scene.get("importance_reasons") or [])
 
     return {
         "scene_id": scene.get("scene_id"),
@@ -120,7 +142,14 @@ def build_scene_record(scene: dict[str, object], index: int, total: int) -> dict
         "end_at": scene.get("end_at"),
         "duration_seconds": scene.get("duration_seconds"),
         "importance_score": scene.get("importance_score"),
+        "selection_score": scene.get("selection_score"),
+        "selection_rank": scene.get("selection_rank"),
         "priority_band": priority_band,
+        "primary_type": scene.get("primary_type"),
+        "modifiers": normalize_modifiers(scene.get("modifiers")),
+        "food_confidence": scene.get("food_confidence"),
+        "selected_for_edit": selected_for_edit,
+        "trip_type": scene.get("trip_type"),
         "representative_tag": scene.get("representative_tag"),
         "tag_strength": scene.get("tag_strength"),
         "role": role,
@@ -134,6 +163,9 @@ def build_scene_record(scene: dict[str, object], index: int, total: int) -> dict
             "path": rep.get("path"),
             "kind": rep.get("kind"),
             "caption": rep.get("caption"),
+            "primary_type": rep.get("primary_type"),
+            "modifiers": normalize_modifiers(rep.get("modifiers")),
+            "food_confidence": rep.get("food_confidence"),
             "face_count": rep.get("face_count"),
             "blur_score": rep.get("blur_score"),
         },
@@ -145,23 +177,34 @@ def build_summary(records: list[dict[str, object]]) -> dict[str, object]:
     action_counts: dict[str, int] = {}
     priority_counts: dict[str, int] = {}
     tag_counts: dict[str, int] = {}
+    selected_scene_count = 0
+    food_scene_count = 0
+    trip_type = str(records[0].get("trip_type") or "general") if records else "general"
 
     for record in records:
         role = str(record.get("role") or "flow")
         action = str(record.get("edit_action") or "keep")
         priority = str(record.get("priority_band") or "low")
         tag = str(record.get("representative_tag") or "未判定")
+        modifiers = normalize_modifiers(record.get("modifiers"))
 
         role_counts[role] = role_counts.get(role, 0) + 1
         action_counts[action] = action_counts.get(action, 0) + 1
         priority_counts[priority] = priority_counts.get(priority, 0) + 1
         tag_counts[tag] = tag_counts.get(tag, 0) + 1
+        if bool(record.get("selected_for_edit")):
+            selected_scene_count += 1
+        if "food" in modifiers:
+            food_scene_count += 1
 
     return {
         "scene_count": len(records),
+        "trip_type": trip_type,
         "role_counts": dict(sorted(role_counts.items())),
         "action_counts": dict(sorted(action_counts.items())),
         "priority_counts": dict(sorted(priority_counts.items())),
+        "selected_scene_count": selected_scene_count,
+        "food_scene_count": food_scene_count,
         "representative_tag_counts": dict(sorted(tag_counts.items(), key=lambda item: (-item[1], item[0]))),
     }
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import math
 import time
@@ -17,13 +18,17 @@ DEFAULT_REPRESENTATIVES = "scene_representatives_tagged.csv"
 DEFAULT_OUTPUT = "scene_edit_candidates.json"
 TZ_NAME = "Asia/Tokyo"
 PREVIEW_SOURCE_LIMIT = 3
+SELECTION_TOP_K_RATIO = 0.3
+GENERAL_MAX_FOOD_RATIO = 0.25
+GOURMET_MAX_FOOD_RATIO = 0.4
+GENERAL_CONSECUTIVE_FOOD_PENALTY = 0.12
+GOURMET_CONSECUTIVE_FOOD_PENALTY = 0.06
 
 TAG_STRENGTH = {
     "人物": "strong",
     "集合写真": "strong",
     "駅": "strong",
     "寺社": "strong",
-    "食事": "strong",
     "建物": "medium",
     "移動": "medium",
     "風景": "weak",
@@ -42,12 +47,6 @@ OCR_DICTIONARY = [
     "寺社",
     "寺",
     "神宮",
-    "食事",
-    "ランチ",
-    "ディナー",
-    "ラーメン",
-    "寿司",
-    "そば",
     "建物",
     "ビル",
     "museum",
@@ -61,10 +60,24 @@ OCR_DICTIONARY = [
     "夜景",
 ]
 
+PRIMARY_TYPE_TO_TAG = {
+    "people": "人物",
+    "group": "集合写真",
+    "station": "駅",
+    "temple": "寺社",
+    "building": "建物",
+    "landscape": "風景",
+    "night": "夜景",
+    "transit": "移動",
+}
+TAG_TO_PRIMARY_TYPE = {tag: primary_type for primary_type, tag in PRIMARY_TYPE_TO_TAG.items()}
+
 
 def is_missing(value: object) -> bool:
     if value is None:
         return True
+    if isinstance(value, (list, tuple, set, dict)):
+        return False
     if pd.isna(value):
         return True
     text = str(value).strip()
@@ -106,6 +119,49 @@ def relpath(value: object, root: Path) -> str | None:
         return str(path.relative_to(root))
     except Exception:
         return str(path)
+
+
+def clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
+    return max(lower, min(value, upper))
+
+
+def unique_strings(values: list[object]) -> list[str]:
+    items: list[str] = []
+    for value in values:
+        if is_missing(value):
+            continue
+        text = str(value).strip()
+        if not text or text in items:
+            continue
+        items.append(text)
+    return items
+
+
+def parse_string_list(value: object) -> list[str]:
+    if is_missing(value):
+        return []
+    if isinstance(value, list):
+        return unique_strings(value)
+    if isinstance(value, (tuple, set)):
+        return unique_strings(list(value))
+
+    text = str(value).strip()
+    if not text:
+        return []
+
+    parsed: object = None
+    if text.startswith("[") or text.startswith("("):
+        for parser in (json.loads, ast.literal_eval):
+            try:
+                parsed = parser(text)
+                break
+            except Exception:
+                continue
+    if isinstance(parsed, (list, tuple, set)):
+        return unique_strings(list(parsed))
+    if "," in text:
+        return unique_strings([part.strip() for part in text.split(",")])
+    return unique_strings([text])
 
 
 def haversine_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -284,6 +340,37 @@ def normalize_tag(tag: object) -> str | None:
     return text or None
 
 
+def normalize_primary_type(primary_type: object, fallback_tag: object = None) -> str:
+    normalized = normalize_tag(primary_type)
+    if normalized in PRIMARY_TYPE_TO_TAG:
+        return normalized
+
+    fallback = normalize_tag(fallback_tag)
+    if fallback == "食事":
+        return "landscape"
+    if fallback is None:
+        return "landscape"
+    return TAG_TO_PRIMARY_TYPE.get(fallback, "landscape")
+
+
+def legacy_tag_for_primary_type(primary_type: object, fallback_tag: object = None) -> str:
+    normalized = normalize_primary_type(primary_type, fallback_tag)
+    return PRIMARY_TYPE_TO_TAG.get(normalized, normalize_tag(fallback_tag) or "風景")
+
+
+def normalize_modifiers(value: object, *, fallback_tag: object = None, food_confidence: float | None = None) -> list[str]:
+    modifiers = parse_string_list(value)
+    if normalize_tag(fallback_tag) == "食事" and "food" not in modifiers:
+        modifiers.append("food")
+    if food_confidence is not None and food_confidence >= 0.7 and "food" not in modifiers:
+        modifiers.append("food")
+    return unique_strings(modifiers)
+
+
+def has_modifier(record: dict[str, object], modifier: str) -> bool:
+    return modifier in normalize_modifiers(record.get("modifiers"))
+
+
 def tag_strength(tag: object) -> str:
     normalized = normalize_tag(tag)
     if normalized is None:
@@ -321,6 +408,7 @@ def build_flow_summary(scene_record: dict[str, object]) -> str:
     gps = scene_record.get("gps") if isinstance(scene_record.get("gps"), dict) else {}
     tag = scene_record.get("representative_tag") or "未判定"
     priority = scene_record.get("priority_band") or "low"
+    modifiers = normalize_modifiers(scene_record.get("modifiers"))
 
     kind_parts: list[str] = []
     if isinstance(asset_count, int):
@@ -334,113 +422,277 @@ def build_flow_summary(scene_record: dict[str, object]) -> str:
             kind_parts.append(f"{video_count}本")
 
     gps_label = "GPSあり" if gps.get("has_gps") else "GPSなし"
-    return " / ".join([part for part in [duration_label, *kind_parts, gps_label, f"tag:{tag}", f"priority:{priority}"] if part])
+    modifier_text = f"mod:{','.join(modifiers)}" if modifiers else None
+    return " / ".join([part for part in [duration_label, *kind_parts, gps_label, f"tag:{tag}", modifier_text, f"priority:{priority}"] if part])
 
 
-def compute_importance(group: pd.DataFrame, rep: pd.Series | None, gps_summary: dict[str, object]) -> tuple[float, list[str]]:
-    # This score is meant to help choose scenes for the final edit, so we bias it
-    # toward scene continuity and viewing flow rather than OCR/face semantics.
-    score = 0.4
+def compute_scene_signals(
+    group: pd.DataFrame,
+    rep: pd.Series | None,
+    gps_summary: dict[str, object],
+) -> tuple[dict[str, float], list[str], dict[str, object]]:
     reasons: list[str] = []
+    signals = {
+        "visual_quality": 0.18,
+        "face_signal": 0.0,
+        "motion_signal": 0.0,
+        "novelty_signal": 0.1,
+        "food_signal": 0.0,
+    }
 
     asset_count = int(len(group))
     duration_seconds = group["final_timestamp_dt"].max() - group["final_timestamp_dt"].min()
+    total_seconds = duration_seconds.total_seconds() if duration_seconds is not None else None
     max_gap_seconds = compute_max_gap_seconds(group)
+    scene_meta: dict[str, object] = {
+        "primary_type": "landscape",
+        "modifiers": [],
+        "food_confidence": 0.0,
+        "representative_tag": "風景",
+        "tag_strength": "weak",
+        "meaningful_tokens": [],
+    }
 
     if asset_count >= 2:
-        score += min(0.08 + 0.01 * min(asset_count, 8), 0.14)
+        signals["visual_quality"] += min(0.12 + 0.03 * min(asset_count, 6), 0.30)
         reasons.append("continuous_assets")
 
-    if duration_seconds is not None:
-        total_seconds = duration_seconds.total_seconds()
-        if total_seconds >= 30:
-            score += min(total_seconds / 1800.0, 0.12)
-            reasons.append("scene_duration")
+    if total_seconds is not None and total_seconds >= 30:
+        signals["visual_quality"] += min(total_seconds / 900.0, 0.15)
+        reasons.append("scene_duration")
 
     if gps_summary.get("has_gps"):
-        score += 0.05
+        signals["novelty_signal"] += 0.18
         reasons.append("gps")
 
     if max_gap_seconds <= 120 and asset_count >= 2:
-        score += 0.08
+        signals["motion_signal"] += 0.24
         reasons.append("tight_flow")
     elif max_gap_seconds <= 300:
-        score += 0.04
+        signals["motion_signal"] += 0.12
         reasons.append("moderate_flow")
 
     if rep is not None:
-        tag = normalize_tag(rep.get("tag"))
-        strength = tag_strength(tag)
+        raw_tag = normalize_tag(rep.get("tag"))
+        food_confidence = parse_float(rep.get("food_confidence")) or 0.0
+        modifiers = normalize_modifiers(rep.get("modifiers"), fallback_tag=raw_tag, food_confidence=food_confidence)
+        if "food" in modifiers and food_confidence <= 0.0:
+            food_confidence = 0.75
+        primary_type = normalize_primary_type(rep.get("primary_type"), raw_tag)
+        representative_tag = legacy_tag_for_primary_type(primary_type, raw_tag)
+        strength = tag_strength(representative_tag)
         face_count = parse_float(rep.get("face_count_filtered")) or 0.0
         rep_blur = parse_float(rep.get("representative_laplacian"))
         rep_kind = str(rep.get("representative_kind")) if not is_missing(rep.get("representative_kind")) else None
         rep_duration = parse_float(rep.get("representative_duration_seconds"))
         meaningful_tokens = meaningful_ocr_tokens(rep.get("ocr_text"))
 
-        if tag in {"食事", "駅", "寺社", "集合写真", "人物"}:
-            score += 0.05
-            reasons.append(f"tag:{tag}")
-        elif tag in {"建物", "移動"}:
-            score += 0.03
-            reasons.append(f"tag:{tag}")
-        elif tag == "風景":
-            score += 0.01
-            reasons.append("tag:風景")
+        if rep_blur is not None:
+            blur_boost = min(max(rep_blur, 0.0) / 4000.0, 1.0) * 0.22
+            signals["visual_quality"] += blur_boost
+            if blur_boost > 0:
+                reasons.append("sharp")
+
+        if rep_kind == "video":
+            signals["motion_signal"] += 0.16
+            reasons.append("video")
+            if rep_duration is not None and rep_duration <= 8:
+                signals["visual_quality"] += 0.08
+                reasons.append("short_video")
+            elif rep_duration is not None and rep_duration > 10:
+                signals["visual_quality"] -= 0.08
+                reasons.append("long_video")
+
+        if face_count > 0:
+            signals["face_signal"] += min(face_count * 0.22, 0.65)
+            reasons.append("face")
+
+        if primary_type in {"people", "group"}:
+            signals["face_signal"] += 0.22
+            reasons.append(f"primary:{primary_type}")
+        elif primary_type in {"station", "transit"}:
+            signals["motion_signal"] += 0.18
+            reasons.append(f"primary:{primary_type}")
+        elif primary_type in {"temple", "building"}:
+            signals["novelty_signal"] += 0.14
+            reasons.append(f"primary:{primary_type}")
+        elif primary_type == "night":
+            signals["novelty_signal"] += 0.10
+            reasons.append("primary:night")
+        elif primary_type == "landscape":
+            signals["visual_quality"] += 0.04
+            reasons.append("primary:landscape")
 
         if strength == "strong":
-            score += 0.02
+            signals["novelty_signal"] += 0.08
             reasons.append("strength:strong")
         elif strength == "medium":
-            score += 0.01
+            signals["novelty_signal"] += 0.04
             reasons.append("strength:medium")
         else:
             reasons.append("strength:weak")
 
-        if face_count > 0:
-            score += min(face_count * 0.01, 0.03)
-            reasons.append("face")
-
         if meaningful_tokens:
-            score += min(0.01 + 0.005 * len(meaningful_tokens), 0.03)
+            signals["novelty_signal"] += min(0.10 + 0.03 * len(meaningful_tokens), 0.22)
             reasons.append("ocr")
 
-        if rep_kind == "video" and rep_duration is not None and rep_duration <= 8:
-            score += 0.04
-            reasons.append("short_video")
+        if "food" in modifiers:
+            signals["food_signal"] = max(food_confidence, 0.35)
+            reasons.append("food_modifier")
 
-        if rep_kind == "video" and rep_duration is not None and rep_duration > 10:
-            score -= 0.05
-            reasons.append("long_video")
-
-        if rep_blur is not None:
-            blur_boost = min(max(rep_blur, 0.0) / 4000.0, 1.0) * 0.05
-            score += blur_boost
-            if blur_boost > 0:
-                reasons.append("sharp")
-
-        if tag == "風景" and not meaningful_tokens:
-            score -= 0.04
+        if representative_tag == "風景" and not meaningful_tokens:
+            signals["novelty_signal"] -= 0.08
             reasons.append("sparse_ocr")
 
-    if duration_seconds is not None:
-        total_seconds = duration_seconds.total_seconds()
+        scene_meta = {
+            "primary_type": primary_type,
+            "modifiers": modifiers,
+            "food_confidence": round(food_confidence, 3),
+            "representative_tag": representative_tag,
+            "tag_strength": strength,
+            "meaningful_tokens": meaningful_tokens,
+        }
+
+    if total_seconds is not None:
         if total_seconds > 1200:
-            score -= 0.18
+            signals["novelty_signal"] -= 0.24
             reasons.append("very_long")
         elif total_seconds > 600:
-            score -= 0.10
+            signals["novelty_signal"] -= 0.12
             reasons.append("long")
 
     if asset_count > 15:
-        score -= 0.08
+        signals["novelty_signal"] -= 0.10
         reasons.append("many_assets")
 
     if max_gap_seconds > 600:
-        score -= 0.14
+        signals["motion_signal"] -= 0.22
         reasons.append("big_gap")
 
-    score = max(0.0, min(score, 1.0))
-    return round(score, 3), reasons
+    normalized_signals = {name: round(clamp(value), 3) for name, value in signals.items()}
+    scene_meta["max_gap_seconds"] = round(max_gap_seconds, 3)
+    return normalized_signals, unique_strings(reasons), scene_meta
+
+
+def infer_trip_type(records: list[dict[str, object]]) -> str:
+    if not records:
+        return "general"
+    food_count = sum(1 for record in records if has_modifier(record, "food"))
+    food_ratio = food_count / max(len(records), 1)
+    return "gourmet" if food_ratio > 0.4 else "general"
+
+
+def selection_weights(trip_type: str) -> dict[str, float]:
+    if trip_type == "gourmet":
+        return {
+            "visual_quality": 0.38,
+            "face_signal": 0.20,
+            "motion_signal": 0.17,
+            "novelty_signal": 0.17,
+            "food_signal": 0.08,
+        }
+    return {
+        "visual_quality": 0.40,
+        "face_signal": 0.22,
+        "motion_signal": 0.18,
+        "novelty_signal": 0.16,
+        "food_signal": 0.04,
+    }
+
+
+def rank_scene_indices(records: list[dict[str, object]]) -> list[int]:
+    return sorted(
+        range(len(records)),
+        key=lambda idx: (
+            -float(records[idx].get("selection_score") or 0.0),
+            str(records[idx].get("start_at") or ""),
+            int(records[idx].get("scene_id") or 0),
+        ),
+    )
+
+
+def target_selected_count(total: int) -> int:
+    if total <= 0:
+        return 0
+    return max(1, int(math.ceil(total * SELECTION_TOP_K_RATIO)))
+
+
+def max_food_selection_count(selected_count: int, trip_type: str) -> int:
+    if selected_count <= 0:
+        return 0
+    ratio = GOURMET_MAX_FOOD_RATIO if trip_type == "gourmet" else GENERAL_MAX_FOOD_RATIO
+    return max(1, int(math.floor(selected_count * ratio)))
+
+
+def append_selection_reason(record: dict[str, object], reason: str) -> None:
+    reasons = unique_strings(list(record.get("selection_reasons") or []))
+    if reason not in reasons:
+        reasons.append(reason)
+    record["selection_reasons"] = reasons
+
+
+def enforce_food_quota(records: list[dict[str, object]], ranked_indices: list[int], trip_type: str) -> set[int]:
+    selected_set = set(ranked_indices[: target_selected_count(len(records))])
+    max_food_count = max_food_selection_count(len(selected_set), trip_type)
+    selected_food_indices = [idx for idx in selected_set if has_modifier(records[idx], "food")]
+    if len(selected_food_indices) <= max_food_count:
+        return selected_set
+
+    removable = sorted(
+        selected_food_indices,
+        key=lambda idx: (
+            float(records[idx].get("selection_score") or 0.0),
+            str(records[idx].get("start_at") or ""),
+            int(records[idx].get("scene_id") or 0),
+        ),
+    )
+    replacements = [idx for idx in ranked_indices if idx not in selected_set and not has_modifier(records[idx], "food")]
+
+    remove_count = len(selected_food_indices) - max_food_count
+    for index in removable[:remove_count]:
+        selected_set.discard(index)
+        append_selection_reason(records[index], "quota_replaced")
+        if replacements:
+            replacement = replacements.pop(0)
+            selected_set.add(replacement)
+            append_selection_reason(records[replacement], "quota_promoted")
+    return selected_set
+
+
+def apply_selection_strategy(records: list[dict[str, object]]) -> None:
+    if not records:
+        return
+
+    trip_type = infer_trip_type(records)
+    weights = selection_weights(trip_type)
+    food_penalty = GOURMET_CONSECUTIVE_FOOD_PENALTY if trip_type == "gourmet" else GENERAL_CONSECUTIVE_FOOD_PENALTY
+    previous_food = False
+
+    for record in records:
+        components = record.get("selection_components") if isinstance(record.get("selection_components"), dict) else {}
+        score = 0.0
+        for name, weight in weights.items():
+            score += weight * float(components.get(name) or 0.0)
+        record["trip_type"] = trip_type
+        record["selection_reasons"] = unique_strings(list(record.get("selection_reasons") or []) + [f"trip_type:{trip_type}"])
+        if previous_food and has_modifier(record, "food"):
+            score -= food_penalty
+            append_selection_reason(record, "food_penalty:consecutive")
+        record["selection_score"] = round(clamp(score), 3)
+        previous_food = has_modifier(record, "food")
+
+    ranked_indices = rank_scene_indices(records)
+    selected_set = enforce_food_quota(records, ranked_indices, trip_type)
+
+    for rank, index in enumerate(ranked_indices, start=1):
+        records[index]["selection_rank"] = rank
+
+    for index, record in enumerate(records):
+        selected_for_edit = index in selected_set
+        record["selected_for_edit"] = selected_for_edit
+        record["priority_band"] = priority_band(float(record.get("selection_score") or 0.0))
+        record["importance_score"] = record.get("selection_score")
+        record["importance_reasons"] = list(record.get("selection_reasons") or [])
 
 
 def build_scene_records(media_scene: pd.DataFrame, reps: pd.DataFrame, root: Path) -> list[dict[str, object]]:
@@ -469,17 +721,19 @@ def build_scene_records(media_scene: pd.DataFrame, reps: pd.DataFrame, root: Pat
         rep_row = rep_match.iloc[0] if not rep_match.empty else None
 
         gps_summary = compute_gps_summary(group)
-        importance_score, importance_reasons = compute_importance(group, rep_row, gps_summary)
-        max_gap_seconds = compute_max_gap_seconds(group)
+        signals, selection_reasons, scene_meta = compute_scene_signals(group, rep_row, gps_summary)
 
         video_count = int((group["kind"].astype(str).str.lower() == "video").sum())
         image_count = int((group["kind"].astype(str).str.lower() == "image").sum())
         models = unique_nonmissing(group["model"])
         kinds = unique_nonmissing(group["kind"])
-        tokens = meaningful_ocr_tokens(rep_row.get("ocr_text")) if rep_row is not None else []
-        rep_tag = normalize_tag(rep_row.get("tag")) if rep_row is not None else None
-        rep_strength = tag_strength(rep_tag) if rep_row is not None else "weak"
-        scene_priority = priority_band(importance_score)
+        tokens = list(scene_meta.get("meaningful_tokens") or [])
+        rep_tag = str(scene_meta.get("representative_tag") or "風景")
+        rep_strength = str(scene_meta.get("tag_strength") or "weak")
+        modifiers = list(scene_meta.get("modifiers") or [])
+        primary_type = str(scene_meta.get("primary_type") or "landscape")
+        food_confidence = float(scene_meta.get("food_confidence") or 0.0)
+        max_gap_seconds = float(scene_meta.get("max_gap_seconds") or 0.0)
 
         scene_record: dict[str, object] = {
             "scene_id": int(scene_id),
@@ -493,9 +747,18 @@ def build_scene_records(media_scene: pd.DataFrame, reps: pd.DataFrame, root: Pat
             "kinds": kinds,
             "models": models,
             "gps": gps_summary,
-            "importance_score": importance_score,
-            "importance_reasons": importance_reasons,
-            "priority_band": scene_priority,
+            "importance_score": None,
+            "importance_reasons": [],
+            "priority_band": "low",
+            "primary_type": primary_type,
+            "modifiers": modifiers,
+            "food_confidence": round(food_confidence, 3),
+            "selection_components": signals,
+            "selection_score": None,
+            "selection_rank": None,
+            "selected_for_edit": False,
+            "selection_reasons": selection_reasons,
+            "trip_type": None,
             "tag_strength": rep_strength,
             "representative_tag": rep_tag,
             "meaningful_ocr_token_count": len(tokens),
@@ -512,6 +775,9 @@ def build_scene_records(media_scene: pd.DataFrame, reps: pd.DataFrame, root: Pat
                 "tag": rep_tag,
                 "tag_strength": rep_strength,
                 "caption": None if is_missing(rep_row.get("caption")) else str(rep_row.get("caption")),
+                "primary_type": primary_type,
+                "modifiers": modifiers,
+                "food_confidence": round(food_confidence, 3),
                 "meaningful_ocr_token_count": len(tokens),
                 "meaningful_ocr_tokens": tokens,
                 "face_count_raw": None if is_missing(rep_row.get("face_count_raw")) else int(float(rep_row.get("face_count_raw"))),
@@ -521,10 +787,12 @@ def build_scene_records(media_scene: pd.DataFrame, reps: pd.DataFrame, root: Pat
                 "blur_score": parse_float(rep_row.get("representative_laplacian")),
             }
 
-        scene_record["flow_summary"] = build_flow_summary(scene_record)
         records.append(scene_record)
 
     records.sort(key=lambda item: (item.get("start_at") or "", item.get("scene_id") or 0))
+    apply_selection_strategy(records)
+    for record in records:
+        record["flow_summary"] = build_flow_summary(record)
     return records
 
 
@@ -535,6 +803,10 @@ def build_payload_summary(records: list[dict[str, object]]) -> dict[str, object]
     mixed_scene_count = 0
     video_only_scene_count = 0
     image_only_scene_count = 0
+    food_scene_count = 0
+    selected_scene_count = 0
+    selected_food_scene_count = 0
+    trip_type = str(records[0].get("trip_type") or "general") if records else "general"
 
     for record in records:
         priority = str(record.get("priority_band") or "low")
@@ -560,13 +832,26 @@ def build_payload_summary(records: list[dict[str, object]]) -> dict[str, object]
         elif video_count > 0:
             video_only_scene_count += 1
 
+        is_food = has_modifier(record, "food")
+        if is_food:
+            food_scene_count += 1
+        if bool(record.get("selected_for_edit")):
+            selected_scene_count += 1
+            if is_food:
+                selected_food_scene_count += 1
+
     return {
         "scene_count": len(records),
+        "trip_type": trip_type,
         "priority_counts": priority_counts,
         "gps_scene_count": gps_scene_count,
         "mixed_scene_count": mixed_scene_count,
         "image_only_scene_count": image_only_scene_count,
         "video_only_scene_count": video_only_scene_count,
+        "food_scene_count": food_scene_count,
+        "food_scene_ratio": round(food_scene_count / max(len(records), 1), 3) if records else 0.0,
+        "selected_scene_count": selected_scene_count,
+        "selected_food_scene_count": selected_food_scene_count,
         "representative_tag_counts": dict(sorted(tag_counts.items(), key=lambda item: (-item[1], item[0]))),
     }
 
