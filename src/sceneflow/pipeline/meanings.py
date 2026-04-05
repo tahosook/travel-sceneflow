@@ -156,6 +156,10 @@ def build_scene_record(scene: dict[str, object], index: int, total: int) -> dict
         "trip_type": scene.get("trip_type"),
         "representative_tag": scene.get("representative_tag"),
         "tag_strength": scene.get("tag_strength"),
+        "clip_hints": list(scene.get("clip_hints") or []),
+        "semantic_summary": scene.get("semantic_summary"),
+        "semantic_confidence": scene.get("semantic_confidence"),
+        "classification_source": scene.get("classification_source"),
         "role": role,
         "edit_action": action,
         "summary": summary,
@@ -173,6 +177,9 @@ def build_scene_record(scene: dict[str, object], index: int, total: int) -> dict
             "food_confidence_representative": rep.get("food_confidence_representative"),
             "face_count": rep.get("face_count"),
             "blur_score": rep.get("blur_score"),
+            "clip_top_labels": list(rep.get("clip_top_labels") or []),
+            "classification_source": rep.get("classification_source"),
+            "classification_confidence": rep.get("classification_confidence"),
         },
     }
 

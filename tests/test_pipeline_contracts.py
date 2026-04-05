@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import io
+import json
+import sys
 from pathlib import Path
 
 import pandas as pd
 
-from sceneflow.pipeline import candidates, llm_plan, meanings, render, representatives, sceneify, structure
+from sceneflow.pipeline import candidates, gemini_plan, llm_plan, meanings, render, representatives, sceneify, structure, tagging
 from tests.helpers import build_tagged_representatives
 
 
@@ -65,11 +67,16 @@ def build_synthetic_inputs(tmp_path: Path, scene_specs: list[dict[str, object]])
                 "face_count_raw": int(spec.get("face_count", 0)),
                 "face_count_filtered": int(spec.get("face_count", 0)),
                 "face_count": int(spec.get("face_count", 0)),
+                "clip_primary_type": spec.get("clip_primary_type"),
+                "clip_primary_score": float(spec.get("clip_primary_score", 0.0)),
+                "clip_top_labels": list(spec.get("clip_top_labels", [])),
                 "tag": tag,
                 "primary_type": str(spec.get("primary_type", "landscape")),
                 "modifiers": list(spec.get("modifiers", [])),
                 "food_confidence": float(spec.get("food_confidence", 0.0)),
                 "caption": str(spec.get("caption", CAPTION_BY_TAG.get(tag, "旅の一枚です。"))),
+                "classification_source": str(spec.get("classification_source", "clip" if spec.get("clip_primary_type") else "time")),
+                "classification_confidence": float(spec.get("classification_confidence", spec.get("clip_primary_score", 0.35))),
             }
         )
 
@@ -131,6 +138,8 @@ def test_candidates_to_llm_contracts(media_info_csv: Path, sample_root: Path) ->
     assert payload_summary["scene_count"] == 3
     assert records[0]["representative"]["path"] == "trip/day1/overview-02.jpg"
     assert "浅草寺" in records[2]["representative"]["meaningful_ocr_tokens"]
+    assert records[2]["clip_hints"][0]["label"] == "temple or shrine"
+    assert "CLIP:temple or shrine" in records[2]["semantic_summary"]
     assert [source["path"] for source in records[0]["preview_sources"]] == [
         "trip/day1/overview-01.jpg",
         "trip/day1/overview-clip.mp4",
@@ -144,6 +153,9 @@ def test_candidates_to_llm_contracts(media_info_csv: Path, sample_root: Path) ->
     assert set(meanings_payload) >= {"generated_at", "summary", "scenes", "scene_count"}
     assert set(structure_payload) >= {"generated_at", "summary", "chapters", "edit_sequence", "scene_count"}
     assert set(draft_plan) >= {"title", "logline", "chapter_list", "title_cards", "edit_sequence", "render_guidance", "editor_brief"}
+    assert meanings_payload["scenes"][2]["semantic_summary"] == records[2]["semantic_summary"]
+    assert structure_payload["edit_sequence"][2]["clip_hints"][0]["label"] == "temple or shrine"
+    assert structure_payload["edit_sequence"][1]["classification_source"] == "ocr"
 
     assert meanings_payload["summary"]["role_counts"] == {"closing": 1, "opening": 1, "transition": 1}
     assert meanings_payload["summary"]["action_counts"] == {"keep": 3}
@@ -762,3 +774,345 @@ def test_interactive_overrides_update_overlay_titles_and_subtitles(media_info_cs
     assert updated["subtitle_plan"]["items"][1]["origin"] == "auto"
     assert updated["edit_sequence"][2]["planned_duration_seconds"] > updated["edit_sequence"][2]["base_planned_duration_seconds"]
     assert updated["edit_sequence"][1]["planned_duration_seconds"] < updated["edit_sequence"][1]["base_planned_duration_seconds"]
+
+
+def test_classify_scene_attributes_prefers_ocr_face_clip_and_time() -> None:
+    row = pd.Series({"representative_final_timestamp": "2024-05-01T20:00:00+09:00"})
+    confident_clip = tagging.ClipPrediction(
+        primary_type="temple",
+        tag="寺社",
+        primary_score=0.76,
+        top_labels=[{"label": "temple or shrine", "score": 0.76}],
+        modifier_scores={"food": 0.08},
+    )
+    weak_clip = tagging.ClipPrediction(
+        primary_type="temple",
+        tag="寺社",
+        primary_score=0.12,
+        top_labels=[{"label": "temple or shrine", "score": 0.12}],
+        modifier_scores={},
+    )
+
+    tag, primary_type, modifiers, source, _, confidence = tagging.classify_scene_attributes(
+        row,
+        "浅草寺 temple",
+        0,
+        0.0,
+        clip_prediction=confident_clip,
+    )
+    assert (tag, primary_type, modifiers, source) == ("寺社", "temple", [], "ocr")
+    assert confidence > 0.8
+
+    tag, primary_type, modifiers, source, _, confidence = tagging.classify_scene_attributes(
+        row,
+        "",
+        2,
+        0.0,
+        clip_prediction=confident_clip,
+    )
+    assert (tag, primary_type, modifiers, source) == ("集合写真", "group", [], "face")
+    assert confidence > 0.7
+
+    tag, primary_type, modifiers, source, _, confidence = tagging.classify_scene_attributes(
+        row,
+        "",
+        0,
+        0.0,
+        clip_prediction=confident_clip,
+    )
+    assert (tag, primary_type, modifiers, source) == ("寺社", "temple", [], "clip")
+    assert confidence == 0.76
+
+    tag, primary_type, modifiers, source, _, confidence = tagging.classify_scene_attributes(
+        row,
+        "",
+        0,
+        0.0,
+        clip_prediction=weak_clip,
+    )
+    assert (tag, primary_type, modifiers, source) == ("夜景", "night", [], "time")
+    assert confidence == 0.35
+
+
+def test_classify_clip_predictions_uses_cache(tmp_path: Path, monkeypatch) -> None:
+    image_path = tmp_path / "analysis.jpg"
+    image_path.write_bytes(b"clip-fixture")
+    cache_dir = tmp_path / "clip-cache"
+    call_count = {"count": 0}
+
+    class FakeClassifier:
+        def classify_paths(self, image_paths: list[Path]) -> list[tagging.ClipPrediction]:
+            call_count["count"] += 1
+            assert image_paths == [image_path]
+            return [
+                tagging.ClipPrediction(
+                    primary_type="temple",
+                    tag="寺社",
+                    primary_score=0.74,
+                    top_labels=[{"label": "temple or shrine", "score": 0.74, "primary_type": "temple", "tag": "寺社"}],
+                    modifier_scores={"food": 0.05},
+                )
+            ]
+
+    monkeypatch.setattr(tagging, "build_clip_classifier", lambda **_: FakeClassifier())
+
+    prepared_rows = [
+        {
+            "representative_path": str(image_path),
+            "_analysis_path": str(image_path),
+        }
+    ]
+
+    first = tagging.classify_clip_predictions(
+        prepared_rows,
+        model_name=tagging.DEFAULT_CLIP_MODEL,
+        device="cpu",
+        batch_size=2,
+        cache_dir=cache_dir,
+    )
+    second = tagging.classify_clip_predictions(
+        prepared_rows,
+        model_name=tagging.DEFAULT_CLIP_MODEL,
+        device="cpu",
+        batch_size=2,
+        cache_dir=cache_dir,
+    )
+
+    assert call_count["count"] == 1
+    assert first[0].tag == "寺社"
+    assert second[0].primary_score == 0.74
+    assert any(cache_dir.iterdir())
+
+
+def test_gemini_prompt_compresses_low_priority_scenes_and_omits_raw_fields() -> None:
+    structure_payload = {
+        "summary": {"scene_count": 6, "chapter_count": 3},
+        "chapters": [
+            {"chapter_id": "opening", "title": "旅のはじまり", "purpose": "導入", "pace": "ゆるやか", "scene_ids": [1], "anchor_scene_ids": [1]},
+            {"chapter_id": "body", "title": "旅の流れ", "purpose": "つなぐ", "pace": "一定", "scene_ids": [2, 3, 4, 5], "anchor_scene_ids": [5]},
+            {"chapter_id": "closing", "title": "旅の余韻", "purpose": "締め", "pace": "余韻重視", "scene_ids": [6], "anchor_scene_ids": [6]},
+        ],
+        "edit_sequence": [
+            {"scene_id": 1, "chapter_id": "opening", "role": "opening", "priority_band": "high", "planned_duration_seconds": 2.2, "representative_tag": "風景", "semantic_summary": "導入の景色", "selection_reasons": ["opening"], "representative_path": "/secret/a.jpg"},
+            {"scene_id": 2, "chapter_id": "body", "role": "support", "priority_band": "low", "planned_duration_seconds": 1.2, "representative_tag": "風景", "semantic_summary": "つなぎ1", "selection_reasons": ["support"], "gps": {"has_gps": True}},
+            {"scene_id": 3, "chapter_id": "body", "role": "support", "priority_band": "low", "planned_duration_seconds": 1.1, "representative_tag": "建物", "semantic_summary": "つなぎ2", "selection_reasons": ["support"]},
+            {"scene_id": 4, "chapter_id": "body", "role": "support", "priority_band": "low", "planned_duration_seconds": 1.0, "representative_tag": "風景", "semantic_summary": "つなぎ3", "selection_reasons": ["support"]},
+            {"scene_id": 5, "chapter_id": "body", "role": "highlight", "priority_band": "high", "planned_duration_seconds": 2.8, "representative_tag": "寺社", "semantic_summary": "見どころ", "selection_reasons": ["highlight"]},
+            {"scene_id": 6, "chapter_id": "closing", "role": "closing", "priority_band": "medium", "planned_duration_seconds": 2.0, "representative_tag": "夜景", "semantic_summary": "締め", "selection_reasons": ["closing"]},
+        ],
+    }
+
+    class FakeModels:
+        def count_tokens(self, *, model: str, contents: str):
+            del model
+            token_count = 3200 if "grouped_scene_count" in contents else 9000
+            return type("CountTokensResponse", (), {"total_tokens": token_count})()
+
+    fake_client = type("FakeClient", (), {"models": FakeModels()})()
+    prompt_text, prompt_payload, token_count = gemini_plan.fit_prompt_to_budget(
+        fake_client,
+        structure=structure_payload,
+        model=gemini_plan.DEFAULT_MODEL,
+        token_budget=6000,
+    )
+
+    assert token_count == 3200
+    assert len(prompt_payload["scene_digest"]) < len(structure_payload["edit_sequence"])
+    assert "representative_path" not in prompt_text
+    assert '"gps"' not in prompt_text
+
+
+def test_generate_slideshow_plan_uses_structured_output() -> None:
+    structure_payload = {
+        "summary": {"scene_count": 2, "chapter_count": 2},
+        "chapters": [
+            {"chapter_id": "opening", "title": "旅のはじまり", "purpose": "導入", "pace": "ゆるやか", "scene_ids": [1], "anchor_scene_ids": [1]},
+            {"chapter_id": "closing", "title": "旅の余韻", "purpose": "締め", "pace": "余韻重視", "scene_ids": [2], "anchor_scene_ids": [2]},
+        ],
+        "edit_sequence": [
+            {"scene_id": 1, "chapter_id": "opening", "role": "opening", "priority_band": "high", "planned_duration_seconds": 2.0, "representative_tag": "風景", "semantic_summary": "導入", "selection_reasons": ["opening"]},
+            {"scene_id": 2, "chapter_id": "closing", "role": "closing", "priority_band": "medium", "planned_duration_seconds": 2.1, "representative_tag": "夜景", "semantic_summary": "締め", "selection_reasons": ["closing"]},
+        ],
+    }
+    plan_payload = {
+        "title": "東京の旅",
+        "logline": "導入から余韻まで自然につなぐ。",
+        "chapter_list": [{"chapter_id": "opening", "title": "旅のはじまり", "purpose": "導入", "scene_ids": [1], "editing_note": "ゆっくり入る"}],
+        "scene_directions": [{"scene_ids": [1], "chapter_id": "opening", "emphasis": "high", "recommended_duration_seconds": 2.0, "direction": "景色から始める"}],
+        "subtitle_plan": {"enabled": True, "style": "overlay", "items": [{"scene_ids": [1], "text": "旅のはじまり"}]},
+        "ending_note": "静かな余韻で終える",
+    }
+
+    class FakeUsage:
+        def model_dump(self, exclude_none: bool = True) -> dict[str, object]:
+            del exclude_none
+            return {"prompt_token_count": 111, "total_token_count": 222}
+
+    class FakeModels:
+        def count_tokens(self, *, model: str, contents: str):
+            del model, contents
+            return type("CountTokensResponse", (), {"total_tokens": 111})()
+
+        def generate_content(self, *, model: str, contents: str, config: object):
+            del model, contents, config
+            return type(
+                "GenerateContentResponse",
+                (),
+                {
+                    "parsed": plan_payload,
+                    "text": json.dumps(plan_payload, ensure_ascii=False),
+                    "usage_metadata": FakeUsage(),
+                },
+            )()
+
+    fake_client = type("FakeClient", (), {"models": FakeModels()})()
+    plan, prompt_text, token_usage = gemini_plan.generate_slideshow_plan(
+        structure_payload,
+        client=fake_client,
+        model=gemini_plan.DEFAULT_MODEL,
+        token_budget=6000,
+    )
+
+    assert plan["title"] == "東京の旅"
+    assert token_usage["request_token_count"] == 111
+    assert token_usage["total_token_count"] == 222
+    assert "Gemini Slideshow Prompt" in prompt_text
+
+
+def test_tagging_to_gemini_smoke(monkeypatch, media_info_csv: Path, sample_root: Path, materialized_media_files: list[Path], tmp_path: Path) -> None:
+    del materialized_media_files
+    scene_df = sceneify.process_csv(
+        input_path=media_info_csv,
+        output_path=Path("unused.csv"),
+        tz_name="Asia/Tokyo",
+        gap_minutes=15,
+        gps_gap_meters=100.0,
+        max_scene_minutes=60,
+    )
+    reps_df = representatives.build_representatives(scene_df)
+
+    analysis_dir = tmp_path / "analysis"
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+
+    def fake_analysis_path(path_value: object) -> Path:
+        path = Path(str(path_value))
+        analysis_path = analysis_dir / f"{path.stem}.jpg"
+        analysis_path.write_bytes(b"analysis")
+        return analysis_path
+
+    def fake_ocr_text_for_asset(path_value, kind_value, image_index, cache_dir=None):
+        del kind_value, image_index, cache_dir
+        path = Path(str(path_value))
+        if "temple" in path.name:
+            return "浅草寺 temple", fake_analysis_path(path), [], 6
+        if "transit" in path.name:
+            return "boarding platform", fake_analysis_path(path), [], 4
+        return "", fake_analysis_path(path), [], 0
+
+    def fake_detect_face_counts(image_path: Path):
+        del image_path
+        return (0, 0)
+
+    def fake_detect_food_score(image_path: Path):
+        del image_path
+        return 0
+
+    class FakeClassifier:
+        def classify_paths(self, image_paths: list[Path]) -> list[tagging.ClipPrediction]:
+            predictions: list[tagging.ClipPrediction] = []
+            for path in image_paths:
+                if "temple" in path.name:
+                    predictions.append(
+                        tagging.ClipPrediction(
+                            primary_type="temple",
+                            tag="寺社",
+                            primary_score=0.8,
+                            top_labels=[{"label": "temple or shrine", "score": 0.8, "primary_type": "temple", "tag": "寺社"}],
+                            modifier_scores={},
+                        )
+                    )
+                elif "transit" in path.name:
+                    predictions.append(
+                        tagging.ClipPrediction(
+                            primary_type="transit",
+                            tag="移動",
+                            primary_score=0.41,
+                            top_labels=[{"label": "travel transit", "score": 0.41, "primary_type": "transit", "tag": "移動"}],
+                            modifier_scores={},
+                        )
+                    )
+                else:
+                    predictions.append(
+                        tagging.ClipPrediction(
+                            primary_type="landscape",
+                            tag="風景",
+                            primary_score=0.45,
+                            top_labels=[{"label": "landscape or city view", "score": 0.45, "primary_type": "landscape", "tag": "風景"}],
+                            modifier_scores={},
+                        )
+                    )
+            return predictions
+
+    monkeypatch.setattr(tagging, "ocr_text_for_asset", fake_ocr_text_for_asset)
+    monkeypatch.setattr(tagging, "detect_face_counts", fake_detect_face_counts)
+    monkeypatch.setattr(tagging, "detect_food_score", fake_detect_food_score)
+    monkeypatch.setattr(tagging, "build_clip_classifier", lambda **_: FakeClassifier())
+
+    tagged_reps = tagging.annotate_representatives(
+        reps_df,
+        sample_root,
+        workers=1,
+        cache_dir=tmp_path / "ocr-cache",
+        clip_device="cpu",
+        clip_cache_dir=tmp_path / "clip-cache",
+    )
+    records = candidates.build_scene_records(scene_df, tagged_reps, sample_root)
+    meanings_payload = meanings.build_meanings({"generated_at": "2026-03-29T11:00:00+09:00", "scenes": records})
+    structure_payload = structure.build_structure(meanings_payload)
+
+    structure_path = tmp_path / "run" / "structure" / "edit_structure.json"
+    structure_path.parent.mkdir(parents=True, exist_ok=True)
+    structure_path.write_text(json.dumps(structure_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    plan_payload = {
+        "title": "東京スライドショー",
+        "logline": "scene の流れを自然につなぐ。",
+        "chapter_list": [{"chapter_id": "opening", "title": "旅のはじまり", "purpose": "導入", "scene_ids": [1], "editing_note": "景色から始める"}],
+        "scene_directions": [{"scene_ids": [1], "chapter_id": "opening", "emphasis": "high", "recommended_duration_seconds": 2.0, "direction": "overview から導入する"}],
+        "subtitle_plan": {"enabled": True, "style": "overlay", "items": [{"scene_ids": [1], "text": "旅のはじまり"}]},
+        "ending_note": "余韻を残して締める",
+    }
+
+    class FakeUsage:
+        def model_dump(self, exclude_none: bool = True) -> dict[str, object]:
+            del exclude_none
+            return {"prompt_token_count": 222, "total_token_count": 333}
+
+    class FakeModels:
+        def count_tokens(self, *, model: str, contents: str):
+            del model, contents
+            return type("CountTokensResponse", (), {"total_tokens": 222})()
+
+        def generate_content(self, *, model: str, contents: str, config: object):
+            del model, contents, config
+            return type(
+                "GenerateContentResponse",
+                (),
+                {
+                    "parsed": plan_payload,
+                    "text": json.dumps(plan_payload, ensure_ascii=False),
+                    "usage_metadata": FakeUsage(),
+                },
+            )()
+
+    monkeypatch.setattr(gemini_plan, "build_gemini_client", lambda api_key=None: type("FakeClient", (), {"models": FakeModels()})())
+    monkeypatch.setattr(sys, "argv", ["gemini", "--input", str(structure_path), "--output", str(tmp_path / "run" / "gemini" / "slideshow_plan.json")])
+
+    assert gemini_plan.main() == 0
+
+    output_path = tmp_path / "run" / "gemini" / "slideshow_plan.json"
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+
+    assert tagged_reps["clip_primary_type"].notna().all()
+    assert payload["plan"]["title"] == "東京スライドショー"
+    assert payload["token_usage"]["request_token_count"] == 222

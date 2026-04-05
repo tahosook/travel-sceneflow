@@ -169,6 +169,24 @@ def parse_string_list(value: object) -> list[str]:
     return unique_strings([text])
 
 
+def parse_json_like(value: object) -> object:
+    if is_missing(value):
+        return None
+    if isinstance(value, (list, tuple, set, dict)):
+        return value
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    for parser in (json.loads, ast.literal_eval):
+        try:
+            return parser(text)
+        except Exception:
+            continue
+    return None
+
+
 def normalized_asset_key(path_value: object) -> str:
     if is_missing(path_value):
         return ""
@@ -215,6 +233,33 @@ def unique_nonmissing(values: pd.Series) -> list[str]:
         if text not in items:
             items.append(text)
     return items
+
+
+def parse_clip_top_labels(value: object) -> list[dict[str, object]]:
+    parsed = parse_json_like(value)
+    if not isinstance(parsed, list):
+        return []
+
+    normalized: list[dict[str, object]] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("label") or "").strip()
+        if not label:
+            continue
+        try:
+            score = round(float(item.get("score") or 0.0), 4)
+        except Exception:
+            score = 0.0
+        normalized_item: dict[str, object] = {
+            "label": label,
+            "score": score,
+        }
+        for key in ("primary_type", "tag", "modifier"):
+            if not is_missing(item.get(key)):
+                normalized_item[key] = str(item.get(key)).strip()
+        normalized.append(normalized_item)
+    return normalized
 
 
 def normalize_ocr_tokens(text: object) -> list[str]:
@@ -349,7 +394,6 @@ def choose_scene_food_sample_rows(group: pd.DataFrame, rep: pd.Series | None) ->
     ordered = group.sort_values("final_timestamp_dt", kind="stable").reset_index(drop=True)
     rows: list[pd.Series] = []
     seen_keys: set[str] = set()
-    representative_path = None if rep is None else relpath(rep.get("representative_path"), Path("."))
 
     preferred_indices: list[int] = []
     if rep is not None:
@@ -505,6 +549,18 @@ def has_modifier(record: dict[str, object], modifier: str) -> bool:
     return modifier in normalize_modifiers(record.get("modifiers"))
 
 
+def build_clip_hints(value: object, limit: int = 2) -> list[dict[str, object]]:
+    return parse_clip_top_labels(value)[:limit]
+
+
+def face_bucket(face_count: int, primary_type: str) -> str | None:
+    if primary_type == "group" or face_count >= 2:
+        return "group"
+    if primary_type == "people" or face_count == 1:
+        return "person"
+    return None
+
+
 def tag_strength(tag: object) -> str:
     normalized = normalize_tag(tag)
     if normalized is None:
@@ -532,6 +588,36 @@ def format_duration_label(seconds: object) -> str:
         return f"{minutes}分{secs:02d}秒"
     hours, rem_minutes = divmod(minutes, 60)
     return f"{hours}時間{rem_minutes:02d}分"
+
+
+def build_semantic_summary(scene_record: dict[str, object]) -> str:
+    parts: list[str] = []
+    tag = str(scene_record.get("representative_tag") or "未判定")
+    parts.append(f"主題:{tag}")
+    parts.append(format_duration_label(scene_record.get("duration_seconds")))
+
+    try:
+        face_count = int(scene_record.get("representative", {}).get("face_count") or 0)
+    except Exception:
+        face_count = 0
+    bucket = face_bucket(face_count, str(scene_record.get("primary_type") or "landscape"))
+    if bucket == "group":
+        parts.append("人物:複数")
+    elif bucket == "person":
+        parts.append("人物:単独")
+
+    if has_modifier(scene_record, "food"):
+        parts.append("food")
+
+    ocr_tokens = list(scene_record.get("meaningful_ocr_tokens") or [])[:3]
+    if ocr_tokens:
+        parts.append("OCR:" + ",".join(str(token) for token in ocr_tokens))
+
+    clip_hints = list(scene_record.get("clip_hints") or [])[:2]
+    if clip_hints:
+        parts.append("CLIP:" + ",".join(str(hint.get("label") or "") for hint in clip_hints if hint.get("label")))
+
+    return " / ".join([part for part in parts if part])
 
 
 def build_flow_summary(scene_record: dict[str, object]) -> str:
@@ -590,6 +676,9 @@ def compute_scene_signals(
         "representative_tag": "風景",
         "tag_strength": "weak",
         "meaningful_tokens": [],
+        "clip_hints": [],
+        "classification_source": "time",
+        "classification_confidence": 0.35,
     }
 
     if asset_count >= 2:
@@ -622,6 +711,9 @@ def compute_scene_signals(
         rep_kind = str(rep.get("representative_kind")) if not is_missing(rep.get("representative_kind")) else None
         rep_duration = parse_float(rep.get("representative_duration_seconds"))
         meaningful_tokens = meaningful_ocr_tokens(rep.get("ocr_text"))
+        clip_hints = build_clip_hints(rep.get("clip_top_labels"))
+        classification_source = str(rep.get("classification_source") or "time")
+        classification_confidence = round(parse_float(rep.get("classification_confidence")) or 0.35, 3)
 
         if rep_blur is not None:
             blur_boost = min(max(rep_blur, 0.0) / 4000.0, 1.0) * 0.22
@@ -671,6 +763,9 @@ def compute_scene_signals(
         if meaningful_tokens:
             signals["novelty_signal"] += min(0.10 + 0.03 * len(meaningful_tokens), 0.22)
             reasons.append("ocr")
+        elif clip_hints:
+            signals["novelty_signal"] += min(0.06 + 0.03 * len(clip_hints), 0.14)
+            reasons.append("clip")
 
         scene_food = scene_food or {}
         scene_food_confidence = float(scene_food.get("food_confidence") or 0.0)
@@ -693,6 +788,8 @@ def compute_scene_signals(
         if representative_tag == "風景" and not meaningful_tokens:
             signals["novelty_signal"] -= 0.08
             reasons.append("sparse_ocr")
+        if classification_source:
+            reasons.append(f"classification:{classification_source}")
 
         scene_meta = {
             "primary_type": primary_type,
@@ -705,6 +802,9 @@ def compute_scene_signals(
             "representative_tag": representative_tag,
             "tag_strength": strength,
             "meaningful_tokens": meaningful_tokens,
+            "clip_hints": clip_hints,
+            "classification_source": classification_source,
+            "classification_confidence": classification_confidence,
         }
 
     if total_seconds is not None:
@@ -895,6 +995,9 @@ def build_scene_records(media_scene: pd.DataFrame, reps: pd.DataFrame, root: Pat
         food_evidence_count = int(scene_meta.get("food_evidence_count") or 0)
         food_sample_paths = list(scene_meta.get("food_sample_paths") or [])
         max_gap_seconds = float(scene_meta.get("max_gap_seconds") or 0.0)
+        clip_hints = list(scene_meta.get("clip_hints") or [])
+        classification_source = str(scene_meta.get("classification_source") or "time")
+        classification_confidence = round(float(scene_meta.get("classification_confidence") or 0.35), 3)
 
         scene_record: dict[str, object] = {
             "scene_id": int(scene_id),
@@ -926,6 +1029,10 @@ def build_scene_records(media_scene: pd.DataFrame, reps: pd.DataFrame, root: Pat
             "trip_type": None,
             "tag_strength": rep_strength,
             "representative_tag": rep_tag,
+            "clip_hints": clip_hints,
+            "semantic_summary": "",
+            "semantic_confidence": classification_confidence,
+            "classification_source": classification_source,
             "meaningful_ocr_token_count": len(tokens),
             "meaningful_ocr_tokens": tokens,
             "preview_sources": build_preview_sources(group, root),
@@ -946,11 +1053,16 @@ def build_scene_records(media_scene: pd.DataFrame, reps: pd.DataFrame, root: Pat
                 "food_confidence_representative": round(representative_food_confidence, 3),
                 "meaningful_ocr_token_count": len(tokens),
                 "meaningful_ocr_tokens": tokens,
+                "clip_primary_type": None if is_missing(rep_row.get("clip_primary_type")) else str(rep_row.get("clip_primary_type")),
+                "clip_primary_score": parse_float(rep_row.get("clip_primary_score")),
+                "clip_top_labels": clip_hints,
                 "face_count_raw": None if is_missing(rep_row.get("face_count_raw")) else int(float(rep_row.get("face_count_raw"))),
                 "face_count_filtered": None if is_missing(rep_row.get("face_count_filtered")) else int(float(rep_row.get("face_count_filtered"))),
                 "face_count": None if is_missing(rep_row.get("face_count")) else int(float(rep_row.get("face_count"))),
                 "duration_seconds": parse_float(rep_row.get("representative_duration_seconds")),
                 "blur_score": parse_float(rep_row.get("representative_laplacian")),
+                "classification_source": classification_source,
+                "classification_confidence": classification_confidence,
             }
 
         records.append(scene_record)
@@ -958,6 +1070,7 @@ def build_scene_records(media_scene: pd.DataFrame, reps: pd.DataFrame, root: Pat
     records.sort(key=lambda item: (item.get("start_at") or "", item.get("scene_id") or 0))
     apply_selection_strategy(records)
     for record in records:
+        record["semantic_summary"] = build_semantic_summary(record)
         record["flow_summary"] = build_flow_summary(record)
     return records
 

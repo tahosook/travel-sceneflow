@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import hashlib
 import json
 import multiprocessing as mp
@@ -12,6 +13,7 @@ import time
 import unicodedata
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import cv2
 import pandas as pd
@@ -58,7 +60,14 @@ OCR_TARGET_WIDTH = 1280
 OCR_CENTER_CROP_RATIO = 0.5
 OCR_POOL_WORKERS = 4
 OCR_CACHE_VERSION = "v3-resize1280-crop50-pool4"
+CLIP_CACHE_VERSION = "v1-openai-clip-zs-travel"
 FOOD_MODIFIER_THRESHOLD = 0.7
+DEFAULT_CLIP_MODEL = "openai/clip-vit-base-patch32"
+DEFAULT_CLIP_DEVICE = "mps"
+DEFAULT_CLIP_BATCH_SIZE = 8
+CLIP_HYPOTHESIS_TEMPLATE = "This is a travel photo of {}."
+CLIP_PRIMARY_CONFIDENCE_THRESHOLD = 0.35
+CLIP_TOP_LABEL_LIMIT = 3
 
 PRIMARY_TYPE_TO_TAG = {
     "people": "人物",
@@ -73,6 +82,29 @@ PRIMARY_TYPE_TO_TAG = {
 TAG_TO_PRIMARY_TYPE = {tag: primary_type for primary_type, tag in PRIMARY_TYPE_TO_TAG.items()}
 PRIMARY_OCR_RULES = [(tag, keywords) for tag, keywords in OCR_RULES if tag != "食事"]
 FOOD_OCR_KEYWORDS = next((keywords for tag, keywords in OCR_RULES if tag == "食事"), [])
+
+CLIP_PRIMARY_LABEL_SPECS = [
+    ("person portrait", "people", "人物"),
+    ("group photo", "group", "集合写真"),
+    ("train station", "station", "駅"),
+    ("temple or shrine", "temple", "寺社"),
+    ("building or landmark", "building", "建物"),
+    ("landscape or city view", "landscape", "風景"),
+    ("night view", "night", "夜景"),
+    ("travel transit", "transit", "移動"),
+]
+CLIP_MODIFIER_LABEL_SPECS = [
+    ("food or meal", "food"),
+]
+
+
+@dataclass
+class ClipPrediction:
+    primary_type: str | None
+    tag: str | None
+    primary_score: float
+    top_labels: list[dict[str, object]]
+    modifier_scores: dict[str, float]
 
 
 def is_missing(value: object) -> bool:
@@ -140,6 +172,10 @@ def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
 def cache_key_for_path(path: Path, variant: str) -> str:
     try:
         stat = path.stat()
@@ -149,7 +185,7 @@ def cache_key_for_path(path: Path, variant: str) -> str:
     return sha256_text(f"{OCR_CACHE_VERSION}|{variant}|{fingerprint}")
 
 
-def read_ocr_cache(cache_dir: Path, cache_key: str) -> dict[str, object] | None:
+def read_cache_payload(cache_dir: Path, cache_key: str) -> dict[str, object] | None:
     cache_path = cache_dir / f"{cache_key}.json"
     if not cache_path.exists():
         return None
@@ -159,7 +195,7 @@ def read_ocr_cache(cache_dir: Path, cache_key: str) -> dict[str, object] | None:
         return None
 
 
-def write_ocr_cache(cache_dir: Path, cache_key: str, payload: dict[str, object]) -> None:
+def write_cache_payload(cache_dir: Path, cache_key: str, payload: dict[str, object]) -> None:
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_path = cache_dir / f"{cache_key}.json"
     tmp_path = cache_dir / f".{cache_key}.{os.getpid()}.tmp"
@@ -168,6 +204,49 @@ def write_ocr_cache(cache_dir: Path, cache_key: str, payload: dict[str, object])
         os.replace(tmp_path, cache_path)
     finally:
         tmp_path.unlink(missing_ok=True)
+
+
+def read_ocr_cache(cache_dir: Path, cache_key: str) -> dict[str, object] | None:
+    return read_cache_payload(cache_dir, cache_key)
+
+
+def write_ocr_cache(cache_dir: Path, cache_key: str, payload: dict[str, object]) -> None:
+    write_cache_payload(cache_dir, cache_key, payload)
+
+
+def clip_cache_key_for_paths(
+    *,
+    source_path: Path,
+    analysis_path: Path,
+    model_name: str,
+    primary_labels: list[str],
+    modifier_labels: list[str],
+) -> str:
+    try:
+        source_stat = source_path.stat()
+        source_fingerprint = f"{source_path.resolve()}|{source_stat.st_mtime_ns}|{source_stat.st_size}"
+    except Exception:
+        source_fingerprint = f"{source_path.resolve()}|missing"
+
+    try:
+        analysis_bytes = analysis_path.read_bytes()
+        analysis_fingerprint = sha256_bytes(analysis_bytes)
+    except Exception:
+        analysis_fingerprint = f"{analysis_path.resolve()}|missing"
+
+    label_fingerprint = "|".join([*primary_labels, *modifier_labels])
+    return sha256_text(
+        "|".join(
+            [
+                CLIP_CACHE_VERSION,
+                model_name,
+                CLIP_HYPOTHESIS_TEMPLATE,
+                label_fingerprint,
+                source_fingerprint,
+                analysis_fingerprint,
+            ]
+        )
+    )
 
 
 def run_tesseract(image_path: Path) -> str:
@@ -349,6 +428,174 @@ def prepare_image_for_analysis(image_path: Path) -> tuple[Path | None, list[Path
         return raster_path, [raster_path]
     raster_path.unlink(missing_ok=True)
     return None, []
+
+
+def clip_primary_label_names() -> list[str]:
+    return [label for label, _, _ in CLIP_PRIMARY_LABEL_SPECS]
+
+
+def clip_modifier_label_names() -> list[str]:
+    return [label for label, _ in CLIP_MODIFIER_LABEL_SPECS]
+
+
+def empty_clip_prediction() -> ClipPrediction:
+    return ClipPrediction(
+        primary_type=None,
+        tag=None,
+        primary_score=0.0,
+        top_labels=[],
+        modifier_scores={},
+    )
+
+
+def serialize_clip_top_labels(labels: list[dict[str, object]]) -> str:
+    return json.dumps(labels, ensure_ascii=False)
+
+
+def is_oom_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "out of memory" in text or "mps backend out of memory" in text
+
+
+def clear_torch_cache(torch_module: Any, device: str) -> None:
+    try:
+        if device == "mps" and hasattr(torch_module, "mps") and hasattr(torch_module.mps, "empty_cache"):
+            torch_module.mps.empty_cache()
+        if device.startswith("cuda") and hasattr(torch_module, "cuda") and hasattr(torch_module.cuda, "empty_cache"):
+            torch_module.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def normalize_clip_predictions(predictions: list[dict[str, object]]) -> ClipPrediction:
+    primary_specs = {label: (primary_type, tag) for label, primary_type, tag in CLIP_PRIMARY_LABEL_SPECS}
+    modifier_specs = {label: modifier for label, modifier in CLIP_MODIFIER_LABEL_SPECS}
+    top_labels: list[dict[str, object]] = []
+    modifier_scores: dict[str, float] = {}
+    primary_type: str | None = None
+    tag: str | None = None
+    primary_score = 0.0
+
+    for item in predictions:
+        label = str(item.get("label") or "").strip()
+        try:
+            score = float(item.get("score") or 0.0)
+        except Exception:
+            score = 0.0
+        score = round(max(0.0, min(score, 1.0)), 4)
+
+        top_entry: dict[str, object] = {
+            "label": label,
+            "score": score,
+        }
+        if label in primary_specs:
+            current_primary_type, current_tag = primary_specs[label]
+            top_entry["primary_type"] = current_primary_type
+            top_entry["tag"] = current_tag
+            if score > primary_score:
+                primary_type = current_primary_type
+                tag = current_tag
+                primary_score = score
+        elif label in modifier_specs:
+            modifier = modifier_specs[label]
+            top_entry["modifier"] = modifier
+            modifier_scores[modifier] = score
+
+        top_labels.append(top_entry)
+
+    return ClipPrediction(
+        primary_type=primary_type,
+        tag=tag,
+        primary_score=round(primary_score, 4),
+        top_labels=top_labels[:CLIP_TOP_LABEL_LIMIT],
+        modifier_scores=modifier_scores,
+    )
+
+
+class ClipZeroShotClassifier:
+    def __init__(
+        self,
+        *,
+        model_name: str,
+        device: str,
+        batch_size: int = DEFAULT_CLIP_BATCH_SIZE,
+    ) -> None:
+        self.model_name = model_name
+        self.device = device
+        self.batch_size = max(1, int(batch_size))
+        self._pipeline = None
+        self._torch = None
+
+    def _ensure_pipeline(self) -> None:
+        if self._pipeline is not None:
+            return
+
+        import torch
+        from transformers import pipeline
+
+        if self.device == "mps" and not torch.backends.mps.is_available():
+            raise RuntimeError("MPS device was requested for CLIP, but torch.backends.mps.is_available() is false")
+
+        self._torch = torch
+        self._pipeline = pipeline(
+            task="zero-shot-image-classification",
+            model=self.model_name,
+            device=self.device,
+        )
+
+    def classify_paths(self, image_paths: list[Path]) -> list[ClipPrediction]:
+        if not image_paths:
+            return []
+
+        self._ensure_pipeline()
+        assert self._pipeline is not None
+
+        candidate_labels = [*clip_primary_label_names(), *clip_modifier_label_names()]
+        results: list[ClipPrediction] = []
+        index = 0
+        batch_size = min(self.batch_size, len(image_paths))
+
+        while index < len(image_paths):
+            current_batch_size = min(batch_size, len(image_paths) - index)
+            batch_paths = image_paths[index : index + current_batch_size]
+            try:
+                raw_output = self._pipeline(
+                    [str(path) for path in batch_paths],
+                    candidate_labels=candidate_labels,
+                    hypothesis_template=CLIP_HYPOTHESIS_TEMPLATE,
+                    batch_size=current_batch_size,
+                )
+            except RuntimeError as exc:
+                if current_batch_size == 1 or not is_oom_error(exc):
+                    raise
+                if self._torch is not None:
+                    clear_torch_cache(self._torch, self.device)
+                batch_size = max(1, current_batch_size // 2)
+                continue
+
+            if raw_output and isinstance(raw_output, list) and batch_paths and isinstance(raw_output[0], dict):
+                output_rows = [raw_output]
+            else:
+                output_rows = list(raw_output or [])
+
+            for prediction_row in output_rows:
+                if isinstance(prediction_row, list):
+                    results.append(normalize_clip_predictions(prediction_row))
+                else:
+                    results.append(empty_clip_prediction())
+
+            index += current_batch_size
+
+        return results
+
+
+def build_clip_classifier(
+    *,
+    model_name: str = DEFAULT_CLIP_MODEL,
+    device: str = DEFAULT_CLIP_DEVICE,
+    batch_size: int = DEFAULT_CLIP_BATCH_SIZE,
+) -> ClipZeroShotClassifier:
+    return ClipZeroShotClassifier(model_name=model_name, device=device, batch_size=batch_size)
 
 
 def build_face_cascade() -> cv2.CascadeClassifier:
@@ -570,13 +817,18 @@ def score_ocr_text(text: str) -> tuple[int, str | None]:
     return scores[0][1], scores[0][2] or None
 
 
-def infer_primary_tag_from_ocr(ocr_text: str) -> tuple[str | None, bool, str | None]:
+def primary_ocr_signal(ocr_text: str) -> tuple[str | None, int, str | None]:
     text = normalize_ocr_output(ocr_text)
     candidates = score_tag_candidates(text, PRIMARY_OCR_RULES)
     if not candidates:
-        return None, False, None
+        return None, 0, None
 
     tag, tag_score, tag_match = candidates[0]
+    return tag, tag_score, tag_match
+
+
+def infer_primary_tag_from_ocr(ocr_text: str) -> tuple[str | None, bool, str | None]:
+    tag, tag_score, tag_match = primary_ocr_signal(ocr_text)
     return tag, tag_score >= 4, tag_match
 
 
@@ -658,23 +910,47 @@ def build_modifiers(food_confidence: float) -> list[str]:
     return modifiers
 
 
+def classification_confidence_for_ocr(score: int) -> float:
+    return round(min(0.98, 0.55 + max(score, 0) * 0.08), 3)
+
+
+def classification_confidence_for_face(face_count_filtered: int) -> float:
+    return round(min(0.92, 0.58 + max(face_count_filtered, 0) * 0.11), 3)
+
+
 def classify_scene_attributes(
     row: pd.Series,
     ocr_text: str,
     face_count_filtered: int,
     food_confidence: float,
-) -> tuple[str, str, list[str], str, str | None]:
+    clip_prediction: ClipPrediction | None = None,
+) -> tuple[str, str, list[str], str, str | None, float]:
     modifiers = build_modifiers(food_confidence)
-    ocr_tag, ocr_strong, ocr_match = infer_primary_tag_from_ocr(ocr_text)
-    if ocr_tag and ocr_strong:
-        return ocr_tag, normalize_primary_type(ocr_tag), modifiers, "ocr", ocr_match
+    ocr_tag, ocr_score, ocr_match = primary_ocr_signal(ocr_text)
+    if ocr_tag and ocr_score >= 4:
+        return ocr_tag, normalize_primary_type(ocr_tag), modifiers, "ocr", ocr_match, classification_confidence_for_ocr(ocr_score)
 
     face_tag = infer_tag_from_face(face_count_filtered)
     if face_tag:
-        return face_tag, normalize_primary_type(face_tag), modifiers, "face", None
+        return face_tag, normalize_primary_type(face_tag), modifiers, "face", None, classification_confidence_for_face(face_count_filtered)
+
+    if (
+        clip_prediction is not None
+        and clip_prediction.primary_type is not None
+        and clip_prediction.tag is not None
+        and clip_prediction.primary_score >= CLIP_PRIMARY_CONFIDENCE_THRESHOLD
+    ):
+        return (
+            clip_prediction.tag,
+            clip_prediction.primary_type,
+            modifiers,
+            "clip",
+            None,
+            round(clip_prediction.primary_score, 3),
+        )
 
     time_tag = infer_tag_from_time(row["representative_final_timestamp"])
-    return time_tag, normalize_primary_type(time_tag), modifiers, "time", None
+    return time_tag, normalize_primary_type(time_tag), modifiers, "time", None, 0.35
 
 
 def build_caption(
@@ -708,6 +984,9 @@ def build_caption(
             return f"{face_count_filtered}人ほど写る集合写真です。"
         return "人物が写る一枚です。"
 
+    if source == "clip" and tag in {"駅", "寺社", "建物", "夜景", "風景", "移動", "人物", "集合写真"}:
+        return TAG_CAPTIONS.get(tag, f"{time_label}の様子が伝わる一枚です。")
+
     if has_food and tag == "夜景":
         return "夜の食事を含む旅の一枚です。"
     if has_food and tag == "風景":
@@ -733,7 +1012,7 @@ def build_caption(
     return TAG_CAPTIONS.get(tag, f"{time_label}の様子が伝わる一枚です。")
 
 
-def process_representative_row(item: tuple[int, dict[str, object]]) -> dict[str, object]:
+def prepare_representative_row(item: tuple[int, dict[str, object]]) -> dict[str, object]:
     row_index, row_data = item
     image_index, cache_dir = get_ocr_worker_context()
     raw_ocr_text, analysis_path, cleanup_paths, _ = ocr_text_for_asset(
@@ -745,19 +1024,10 @@ def process_representative_row(item: tuple[int, dict[str, object]]) -> dict[str,
     face_count_raw, face_count_filtered = detect_face_counts(analysis_path) if analysis_path is not None else (0, 0)
     food_score = detect_food_score(analysis_path) if analysis_path is not None else 0
     food_confidence = compute_food_confidence(food_score, raw_ocr_text)
-    row = pd.Series(row_data)
-    tag, primary_type, modifiers, source, ocr_match = classify_scene_attributes(row, raw_ocr_text, face_count_filtered, food_confidence)
-    caption = build_caption(tag, source, ocr_match, face_count_filtered, row_data["representative_final_timestamp"], modifiers)
 
     cleaned_ocr_text = normalize_ocr_output(raw_ocr_text)
     if len(cleaned_ocr_text) > 240:
         cleaned_ocr_text = cleaned_ocr_text[:240]
-
-    for cleanup_path in cleanup_paths:
-        try:
-            cleanup_path.unlink(missing_ok=True)
-        except Exception:
-            pass
 
     return {
         "scene_id": row_data["scene_id"],
@@ -773,12 +1043,149 @@ def process_representative_row(item: tuple[int, dict[str, object]]) -> dict[str,
         "face_count_raw": face_count_raw,
         "face_count_filtered": face_count_filtered,
         "face_count": face_count_filtered,
+        "food_confidence": food_confidence,
+        "_analysis_path": None if analysis_path is None else str(analysis_path),
+        "_cleanup_paths": [str(path) for path in cleanup_paths],
+        "_row_index": row_index,
+    }
+
+
+def clip_prediction_to_payload(prediction: ClipPrediction) -> dict[str, object]:
+    return {
+        "primary_type": prediction.primary_type,
+        "tag": prediction.tag,
+        "primary_score": prediction.primary_score,
+        "top_labels": prediction.top_labels,
+        "modifier_scores": prediction.modifier_scores,
+    }
+
+
+def clip_prediction_from_payload(payload: dict[str, object] | None) -> ClipPrediction:
+    if not isinstance(payload, dict):
+        return empty_clip_prediction()
+    top_labels = payload.get("top_labels")
+    modifier_scores = payload.get("modifier_scores")
+    return ClipPrediction(
+        primary_type=str(payload.get("primary_type")) if payload.get("primary_type") not in (None, "", "None") else None,
+        tag=str(payload.get("tag")) if payload.get("tag") not in (None, "", "None") else None,
+        primary_score=round(float(payload.get("primary_score") or 0.0), 4),
+        top_labels=list(top_labels) if isinstance(top_labels, list) else [],
+        modifier_scores=dict(modifier_scores) if isinstance(modifier_scores, dict) else {},
+    )
+
+
+def classify_clip_predictions(
+    prepared_rows: list[dict[str, object]],
+    *,
+    model_name: str,
+    device: str,
+    batch_size: int,
+    cache_dir: Path,
+) -> list[ClipPrediction]:
+    predictions: list[ClipPrediction] = [empty_clip_prediction() for _ in prepared_rows]
+    primary_labels = clip_primary_label_names()
+    modifier_labels = clip_modifier_label_names()
+    uncached_indices: list[int] = []
+    uncached_paths: list[Path] = []
+    uncached_keys: list[str] = []
+
+    for index, row in enumerate(prepared_rows):
+        analysis_value = row.get("_analysis_path")
+        source_value = row.get("representative_path")
+        if is_missing(analysis_value) or is_missing(source_value):
+            continue
+
+        analysis_path = Path(str(analysis_value))
+        source_path = Path(str(source_value))
+        if not analysis_path.exists():
+            continue
+
+        cache_key = clip_cache_key_for_paths(
+            source_path=source_path,
+            analysis_path=analysis_path,
+            model_name=model_name,
+            primary_labels=primary_labels,
+            modifier_labels=modifier_labels,
+        )
+        cached = read_cache_payload(cache_dir, cache_key)
+        if cached is not None:
+            predictions[index] = clip_prediction_from_payload(cached)
+            continue
+
+        uncached_indices.append(index)
+        uncached_paths.append(analysis_path)
+        uncached_keys.append(cache_key)
+
+    if uncached_paths:
+        classifier = build_clip_classifier(model_name=model_name, device=device, batch_size=batch_size)
+        uncached_predictions = classifier.classify_paths(uncached_paths)
+        for index, cache_key, prediction, analysis_path in zip(uncached_indices, uncached_keys, uncached_predictions, uncached_paths):
+            predictions[index] = prediction
+            write_cache_payload(
+                cache_dir,
+                cache_key,
+                {
+                    **clip_prediction_to_payload(prediction),
+                    "analysis_path": str(analysis_path),
+                    "model_name": model_name,
+                },
+            )
+
+    return predictions
+
+
+def cleanup_prepared_row(prepared_row: dict[str, object]) -> None:
+    for cleanup_value in list(prepared_row.get("_cleanup_paths") or []):
+        try:
+            Path(str(cleanup_value)).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def finalize_representative_row(prepared_row: dict[str, object], clip_prediction: ClipPrediction) -> dict[str, object]:
+    row = pd.Series(prepared_row)
+    tag, primary_type, modifiers, source, ocr_match, classification_confidence = classify_scene_attributes(
+        row,
+        str(prepared_row.get("ocr_text") or ""),
+        int(prepared_row.get("face_count_filtered") or 0),
+        float(prepared_row.get("food_confidence") or 0.0),
+        clip_prediction=clip_prediction,
+    )
+    caption = build_caption(
+        tag,
+        source,
+        ocr_match,
+        int(prepared_row.get("face_count_filtered") or 0),
+        prepared_row.get("representative_final_timestamp"),
+        modifiers,
+    )
+    cleanup_prepared_row(prepared_row)
+
+    return {
+        "scene_id": prepared_row["scene_id"],
+        "asset_count": prepared_row["asset_count"],
+        "representative_path": prepared_row["representative_path"],
+        "representative_kind": prepared_row["representative_kind"],
+        "representative_final_timestamp": prepared_row["representative_final_timestamp"],
+        "representative_laplacian": prepared_row.get("representative_laplacian"),
+        "representative_brightness": prepared_row.get("representative_brightness"),
+        "representative_duration_seconds": prepared_row.get("representative_duration_seconds"),
+        "representative_has_audio": prepared_row.get("representative_has_audio"),
+        "ocr_text": prepared_row["ocr_text"],
+        "face_count_raw": int(prepared_row.get("face_count_raw") or 0),
+        "face_count_filtered": int(prepared_row.get("face_count_filtered") or 0),
+        "face_count": int(prepared_row.get("face_count") or 0),
+        "clip_primary_type": clip_prediction.primary_type,
+        "clip_primary_score": round(clip_prediction.primary_score, 4),
+        "clip_top_labels": serialize_clip_top_labels(clip_prediction.top_labels),
         "tag": tag,
         "primary_type": primary_type,
         "modifiers": modifiers,
-        "food_confidence": food_confidence,
+        "food_confidence": float(prepared_row.get("food_confidence") or 0.0),
         "caption": caption,
-        "_row_index": row_index,
+        "classification_source": source,
+        "classification_confidence": classification_confidence,
+        "_row_index": prepared_row["_row_index"],
     }
 
 
@@ -789,6 +1196,10 @@ def annotate_representatives(
     *,
     workers: int = OCR_POOL_WORKERS,
     cache_dir: Path | None = None,
+    clip_model: str = DEFAULT_CLIP_MODEL,
+    clip_device: str = DEFAULT_CLIP_DEVICE,
+    clip_batch_size: int = DEFAULT_CLIP_BATCH_SIZE,
+    clip_cache_dir: Path | None = None,
 ) -> pd.DataFrame:
     if isinstance(input_data, pd.DataFrame):
         df = input_data.copy()
@@ -799,41 +1210,56 @@ def annotate_representatives(
 
     image_index = build_image_index(root)
     cache_dir = Path(cache_dir) if cache_dir is not None else Path("outputs") / "ocr_cache"
+    clip_cache_dir = Path(clip_cache_dir) if clip_cache_dir is not None else Path("outputs") / "clip_cache"
 
     rows = [row.to_dict() for _, row in df.iterrows()]
     df = df.copy()
 
     if workers <= 1 or len(rows) <= 1:
-        results = []
+        prepared_rows = []
         init_ocr_worker(image_index, cache_dir)
         for index, row_data in enumerate(rows, start=1):
             if reporter is not None:
                 reporter.update(index, Path(str(row_data["representative_path"])).name if not is_missing(row_data["representative_path"]) else None)
-            results.append(process_representative_row((index - 1, row_data)))
+            prepared_rows.append(prepare_representative_row((index - 1, row_data)))
     else:
         ctx = mp.get_context("spawn")
-        results = [None] * len(rows)
+        prepared_rows = [None] * len(rows)
         with ctx.Pool(
             processes=workers,
             initializer=init_ocr_worker,
             initargs=(image_index, cache_dir),
         ) as pool:
-            for done, result in enumerate(pool.imap_unordered(process_representative_row, enumerate(rows), chunksize=1), start=1):
-                results[int(result["_row_index"])] = result
+            for done, result in enumerate(pool.imap_unordered(prepare_representative_row, enumerate(rows), chunksize=1), start=1):
+                prepared_rows[int(result["_row_index"])] = result
                 if reporter is not None:
                     reporter.update(done, Path(str(result["representative_path"])).name if not is_missing(result["representative_path"]) else None)
 
+    prepared_rows = [row for row in prepared_rows if row is not None]
+    clip_predictions = classify_clip_predictions(
+        prepared_rows,
+        model_name=clip_model,
+        device=clip_device,
+        batch_size=clip_batch_size,
+        cache_dir=clip_cache_dir,
+    )
+    results = [finalize_representative_row(prepared_row, clip_prediction) for prepared_row, clip_prediction in zip(prepared_rows, clip_predictions)]
     results = sorted(results, key=lambda item: (item["scene_id"] if item is not None else 0))
 
     ocr_texts = [row["ocr_text"] for row in results]
     face_counts_raw = [int(row["face_count_raw"]) for row in results]
     face_counts_filtered = [int(row["face_count_filtered"]) for row in results]
     face_counts_alias = [int(row["face_count"]) for row in results]
+    clip_primary_types = [row["clip_primary_type"] for row in results]
+    clip_primary_scores = [row["clip_primary_score"] for row in results]
+    clip_top_labels = [row["clip_top_labels"] for row in results]
     tags = [row["tag"] for row in results]
     primary_types = [row["primary_type"] for row in results]
     modifiers = [row["modifiers"] for row in results]
     food_confidences = [row["food_confidence"] for row in results]
     captions = [row["caption"] for row in results]
+    classification_sources = [row["classification_source"] for row in results]
+    classification_confidences = [row["classification_confidence"] for row in results]
 
     if reporter is not None:
         reporter.finish("tagging complete")
@@ -842,16 +1268,21 @@ def annotate_representatives(
     df["face_count_raw"] = face_counts_raw
     df["face_count_filtered"] = face_counts_filtered
     df["face_count"] = face_counts_alias
+    df["clip_primary_type"] = clip_primary_types
+    df["clip_primary_score"] = clip_primary_scores
+    df["clip_top_labels"] = clip_top_labels
     df["tag"] = tags
     df["primary_type"] = primary_types
     df["modifiers"] = modifiers
     df["food_confidence"] = food_confidences
     df["caption"] = captions
+    df["classification_source"] = classification_sources
+    df["classification_confidence"] = classification_confidences
     return df
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Add OCR and face-based tag and caption to scene representative assets.")
+    parser = argparse.ArgumentParser(description="Add OCR, CLIP, and face-based tag and caption to scene representative assets.")
     parser.add_argument("--input", default="scene_representatives.csv", help="Input representative CSV path")
     parser.add_argument("--output", default=None, help="Output CSV path")
     parser.add_argument("--output-dir", default=None, help="Directory for outputs. Defaults to outputs/<run>/tagging/")
@@ -860,6 +1291,9 @@ def main() -> int:
     parser.add_argument("--progress-interval", type=int, default=1, help="How often to print progress updates")
     parser.add_argument("--workers", type=int, default=OCR_POOL_WORKERS, help="Number of OCR worker processes to use")
     parser.add_argument("--ocr-cache-dir", default=None, help="Directory for OCR result cache. Defaults to <output-dir>/ocr_cache")
+    parser.add_argument("--clip-model", default=DEFAULT_CLIP_MODEL, help="Transformers CLIP checkpoint for zero-shot image classification")
+    parser.add_argument("--clip-device", default=DEFAULT_CLIP_DEVICE, help="Device for CLIP inference. Use mps on Apple Silicon or cpu as fallback")
+    parser.add_argument("--clip-cache-dir", default=None, help="Directory for CLIP cache. Defaults to <output-dir>/clip_cache")
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -876,16 +1310,22 @@ def main() -> int:
     log(f"[tagging] input={input_path}")
     log(f"[tagging] output={output_path}")
     log(f"[tagging] root={root.resolve()}")
+    log(f"[tagging] clip_model={args.clip_model}")
+    log(f"[tagging] clip_device={args.clip_device}")
     start = time.monotonic()
     input_df = pd.read_csv(input_path)
     total = int(input_df.shape[0])
     ocr_cache_dir = Path(args.ocr_cache_dir) if args.ocr_cache_dir is not None else output_path.parent / "ocr_cache"
+    clip_cache_dir = Path(args.clip_cache_dir) if args.clip_cache_dir is not None else output_path.parent / "clip_cache"
     df = annotate_representatives(
         input_df,
         root,
         reporter=ProgressReporter("tagging", total=total, interval=args.progress_interval),
         workers=args.workers,
         cache_dir=ocr_cache_dir,
+        clip_model=args.clip_model,
+        clip_device=args.clip_device,
+        clip_cache_dir=clip_cache_dir,
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(output_path, index=False, na_rep="None")
