@@ -10,7 +10,7 @@ if str(SRC) not in sys.path:
 
 
 def step_main_map() -> dict[str, object]:
-    from sceneflow.pipeline import candidates, llm_plan, meanings, render, representatives, scan, sceneify, structure, tagging
+    from sceneflow.pipeline import candidates, gemini_plan, llm_plan, meanings, render, representatives, scan, sceneify, structure, tagging
 
     return {
         "scan": scan.main,
@@ -20,6 +20,7 @@ def step_main_map() -> dict[str, object]:
         "candidates": candidates.main,
         "meanings": meanings.main,
         "structure": structure.main,
+        "gemini": gemini_plan.main,
         "llm": llm_plan.main,
         "render": render.main,
     }

@@ -11,7 +11,7 @@
 - 画像・動画のメタデータを集める
 - scene を作る
 - scene ごとの代表素材を決める
-- 代表素材に OCR / 顔検出 / 補助タグ付けを行う
+- 代表素材に OCR / 顔検出 / CLIP 補助分類 / 補助タグ付けを行う
 - scene ごとの編集候補 JSON を出力する
 
 ## 前提
@@ -86,9 +86,9 @@ UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_step.py repres
 - `outputs/<run-id>/representatives/scene_representatives.csv`
 - `outputs/<run-id>/representatives/scene_representatives.csv.meta.json`
 
-### 4. 代表素材に OCR / 顔検出 / タグ付けを行う
+### 4. 代表素材に OCR / 顔検出 / CLIP / タグ付けを行う
 
-代表素材に対して OCR と顔検出を行い、簡単なタグと caption を付けます。
+代表素材に対して OCR と顔検出を行い、CLIP の zero-shot 分類も加えて、簡単な tag と caption を付けます。
 
 ```bash
 UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_step.py tagging --input "$RUN_DIR/representatives/scene_representatives.csv" --root . --run-dir "$RUN_DIR"
@@ -106,6 +106,11 @@ UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_step.py taggin
 - `ocr_text`
 - `face_count_raw`
 - `face_count_filtered`
+- `clip_primary_type`
+- `clip_primary_score`
+- `clip_top_labels`
+- `classification_source`
+- `classification_confidence`
 
 ### 5. 編集候補 JSON を作る
 
@@ -149,7 +154,22 @@ UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_step.py struct
 - `outputs/<run-id>/structure/edit_structure.json`
 - `outputs/<run-id>/structure/edit_structure.json.meta.json`
 
-### 8. LLM 用の構成案を作る
+### 8. Gemini でスライドショー構成案を作る
+
+`edit_structure.json` をもとに、Gemini に渡す圧縮済み scene digest を作り、別案のスライドショー構成を生成します。
+この step には `GEMINI_API_KEY` か `GOOGLE_API_KEY` が必要です。
+
+```bash
+UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_step.py gemini --input "$RUN_DIR/structure/edit_structure.json" --run-dir "$RUN_DIR"
+```
+
+生成物:
+
+- `outputs/<run-id>/gemini/slideshow_plan.json`
+- `outputs/<run-id>/gemini/slideshow_plan.prompt.md`
+- `outputs/<run-id>/gemini/slideshow_plan.json.meta.json`
+
+### 9. LLM 用の構成案を作る
 
 編集構造をもとに、LLM に渡す入力と、今すぐ使えるドラフト構成案を作ります。
 
@@ -163,7 +183,7 @@ UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_step.py llm --
 - `outputs/<run-id>/llm/edit_plan.prompt.md`
 - `outputs/<run-id>/llm/edit_plan.json.meta.json`
 
-### 9. プレビューをレンダリングする
+### 10. プレビューをレンダリングする
 
 最後に、構成案をもとに簡易プレビュー動画を作ります。
 
@@ -206,6 +226,7 @@ UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_step.py render
 - `representative` は補助情報つきの代表素材として見る
 - `scene_meanings.json` では各 scene の役割を見る
 - `edit_structure.json` では章立てと順番を見る
+- `slideshow_plan.json` では Gemini による別案を見る
 - `edit_plan.json` では LLM 用の構成案を見る
 - `preview.mp4` では最終的な流れを確認する
 

@@ -7,6 +7,10 @@ requires-python = ">=3.9"
 dependencies = [
     "pandas>=2.3.3",
     "opencv-python>=4.13.0.92",
+    "torch>=2.4,<2.7",
+    "transformers>=4.46,<5",
+    "pillow>=10,<12",
+    "google-genai>=1.27,<2",
 ]
 
 [dependency-groups]

@@ -20,12 +20,13 @@ def main() -> int:
     parser.add_argument('--run-dir', default=None, help='Shared run directory under outputs/')
     parser.add_argument('--with-meanings', action='store_true', help='Also build scene_meanings.json')
     parser.add_argument('--with-structure', action='store_true', help='Also build edit_structure.json')
+    parser.add_argument('--with-gemini', action='store_true', help='Also build slideshow_plan.json with Gemini')
     parser.add_argument('--with-llm', action='store_true', help='Also build edit_plan.json')
     parser.add_argument('--with-render', action='store_true', help='Also render preview.mp4')
     parser.add_argument('--interactive', action='store_true', help='Ask for title/telop overrides during the llm step')
     args = parser.parse_args()
 
-    from sceneflow.pipeline import candidates, llm_plan, meanings, render, representatives, scan, sceneify, structure, tagging
+    from sceneflow.pipeline import candidates, gemini_plan, llm_plan, meanings, render, representatives, scan, sceneify, structure, tagging
 
     root = Path(args.root).resolve()
     if args.run_dir is None:
@@ -52,13 +53,15 @@ def main() -> int:
     ]
 
     with_llm = args.with_llm or args.with_render
-    with_structure = args.with_structure or with_llm
+    with_structure = args.with_structure or args.with_gemini or with_llm
     with_meanings = args.with_meanings or with_structure
 
     if with_meanings:
         steps.append(('meanings', meanings.main, ['meanings', '--input', str(candidates_out), '--run-dir', run_dir_str]))
     if with_structure:
         steps.append(('structure', structure.main, ['structure', '--input', str(meanings_out), '--run-dir', run_dir_str]))
+    if args.with_gemini:
+        steps.append(('gemini', gemini_plan.main, ['gemini', '--input', str(structure_out), '--run-dir', run_dir_str]))
     if with_llm:
         llm_argv = ['llm', '--input', str(structure_out), '--run-dir', run_dir_str]
         if args.interactive:

@@ -41,6 +41,13 @@ UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_pipeline.py --
 UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_pipeline.py --root data/sample --run-dir outputs/sample-run --with-meanings --with-structure
 ```
 
+Gemini を使った別案の `slideshow_plan.json` も作る場合は、先に `GEMINI_API_KEY` か `GOOGLE_API_KEY` を入れたうえで `--with-gemini` を使います。
+
+```bash
+export GEMINI_API_KEY="your-api-key"
+UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_pipeline.py --root data/sample --run-dir outputs/sample-run --with-gemini
+```
+
 `edit_plan.json` と `preview.mp4` まで進めたい場合は、`--with-llm --with-render` を使います。  
 テロップやタイトルをその場で調整したいときは `--interactive` を付けると、`llm` step 中に質問が出ます。  
 この対話では、タイトルだけでなく「誰に見せる動画か」「どの scene を強く見せたいか」「テンポ感」「最後に残したい余韻」も指定できます。
@@ -54,6 +61,7 @@ UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_pipeline.py --
 ```bash
 UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_step.py scan --help
 UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_step.py candidates --help
+UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_step.py gemini --help
 UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_step.py llm --help
 UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_step.py render --help
 ```
@@ -78,12 +86,15 @@ UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python -B scripts/run_checks.py
 - `src/sceneflow/pipeline/representatives.py`
 - `src/sceneflow/pipeline/tagging.py`
 - `src/sceneflow/pipeline/candidates.py`
+- `src/sceneflow/pipeline/gemini_plan.py`
 
 ## 補足
 
 - `data/sample/` はローカル確認用で、実素材を commit する前提ではありません。
 - `outputs/` は git 管理外のローカル生成物です。
 - フルワークフローには `ffmpeg`, `exiftool`, `tesseract` が必要です。
+- `tagging` step は `transformers` の CLIP をローカルで使い、Apple Silicon では既定で `mps` を使います。
+- `gemini` step を動かすには `GEMINI_API_KEY` か `GOOGLE_API_KEY` が必要です。
 - `AGENTS.md` を常設の instruction layer とし、`PLANS.md` は長時間または複雑な作業のときだけ使います。
 - `docs/ai-coding.md` は参照用であり、`AGENTS.md` や `PLANS.md` を上書きしません。
 - `docs/workflow.md` は元ワークフロー由来の詳細メモですが、現行 repo では `scripts/run_pipeline.py` と `scripts/run_step.py` を入口として使うのが安全です。

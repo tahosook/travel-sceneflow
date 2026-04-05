@@ -893,12 +893,12 @@ def test_gemini_prompt_compresses_low_priority_scenes_and_omits_raw_fields() -> 
             {"chapter_id": "closing", "title": "旅の余韻", "purpose": "締め", "pace": "余韻重視", "scene_ids": [6], "anchor_scene_ids": [6]},
         ],
         "edit_sequence": [
-            {"scene_id": 1, "chapter_id": "opening", "role": "opening", "priority_band": "high", "planned_duration_seconds": 2.2, "representative_tag": "風景", "semantic_summary": "導入の景色", "selection_reasons": ["opening"], "representative_path": "/secret/a.jpg"},
-            {"scene_id": 2, "chapter_id": "body", "role": "support", "priority_band": "low", "planned_duration_seconds": 1.2, "representative_tag": "風景", "semantic_summary": "つなぎ1", "selection_reasons": ["support"], "gps": {"has_gps": True}},
-            {"scene_id": 3, "chapter_id": "body", "role": "support", "priority_band": "low", "planned_duration_seconds": 1.1, "representative_tag": "建物", "semantic_summary": "つなぎ2", "selection_reasons": ["support"]},
-            {"scene_id": 4, "chapter_id": "body", "role": "support", "priority_band": "low", "planned_duration_seconds": 1.0, "representative_tag": "風景", "semantic_summary": "つなぎ3", "selection_reasons": ["support"]},
-            {"scene_id": 5, "chapter_id": "body", "role": "highlight", "priority_band": "high", "planned_duration_seconds": 2.8, "representative_tag": "寺社", "semantic_summary": "見どころ", "selection_reasons": ["highlight"]},
-            {"scene_id": 6, "chapter_id": "closing", "role": "closing", "priority_band": "medium", "planned_duration_seconds": 2.0, "representative_tag": "夜景", "semantic_summary": "締め", "selection_reasons": ["closing"]},
+            {"scene_id": 1, "chapter_id": "opening", "role": "opening", "priority_band": "high", "planned_duration_seconds": 2.2, "representative_tag": "風景", "semantic_summary": "導入の景色", "selection_reasons": ["opening"], "representative_path": "/secret/a.jpg", "include": True},
+            {"scene_id": 2, "chapter_id": "body", "role": "support", "priority_band": "low", "planned_duration_seconds": 1.2, "representative_tag": "風景", "semantic_summary": "つなぎ1", "selection_reasons": ["support"], "gps": {"has_gps": True}, "include": True},
+            {"scene_id": 3, "chapter_id": "body", "role": "support", "priority_band": "low", "planned_duration_seconds": 1.1, "representative_tag": "建物", "semantic_summary": "つなぎ2", "selection_reasons": ["support"], "include": True},
+            {"scene_id": 4, "chapter_id": "body", "role": "support", "priority_band": "low", "planned_duration_seconds": 1.0, "representative_tag": "風景", "semantic_summary": "つなぎ3", "selection_reasons": ["support"], "include": False},
+            {"scene_id": 5, "chapter_id": "body", "role": "highlight", "priority_band": "high", "planned_duration_seconds": 2.8, "representative_tag": "寺社", "semantic_summary": "見どころ", "selection_reasons": ["highlight"], "include": True},
+            {"scene_id": 6, "chapter_id": "closing", "role": "closing", "priority_band": "medium", "planned_duration_seconds": 2.0, "representative_tag": "夜景", "semantic_summary": "締め", "selection_reasons": ["closing"], "include": True},
         ],
     }
 
@@ -920,27 +920,51 @@ def test_gemini_prompt_compresses_low_priority_scenes_and_omits_raw_fields() -> 
     assert len(prompt_payload["scene_digest"]) < len(structure_payload["edit_sequence"])
     assert "representative_path" not in prompt_text
     assert '"gps"' not in prompt_text
+    assert all(4 not in entry["scene_ids"] for entry in prompt_payload["scene_digest"])
+    assert prompt_payload["chapters"][1]["scene_ids"] == [2, 3, 5]
+    assert "scene の復活は禁止です" in prompt_text
 
 
 def test_generate_slideshow_plan_uses_structured_output() -> None:
     structure_payload = {
-        "summary": {"scene_count": 2, "chapter_count": 2},
+        "summary": {"scene_count": 4, "chapter_count": 3, "sequence_length_seconds": 19.8},
         "chapters": [
             {"chapter_id": "opening", "title": "旅のはじまり", "purpose": "導入", "pace": "ゆるやか", "scene_ids": [1], "anchor_scene_ids": [1]},
-            {"chapter_id": "closing", "title": "旅の余韻", "purpose": "締め", "pace": "余韻重視", "scene_ids": [2], "anchor_scene_ids": [2]},
+            {"chapter_id": "body", "title": "旅の流れ", "purpose": "見どころ", "pace": "一定", "scene_ids": [2, 3], "anchor_scene_ids": [3]},
+            {"chapter_id": "closing", "title": "旅の余韻", "purpose": "締め", "pace": "余韻重視", "scene_ids": [4], "anchor_scene_ids": [4]},
         ],
         "edit_sequence": [
-            {"scene_id": 1, "chapter_id": "opening", "role": "opening", "priority_band": "high", "planned_duration_seconds": 2.0, "representative_tag": "風景", "semantic_summary": "導入", "selection_reasons": ["opening"]},
-            {"scene_id": 2, "chapter_id": "closing", "role": "closing", "priority_band": "medium", "planned_duration_seconds": 2.1, "representative_tag": "夜景", "semantic_summary": "締め", "selection_reasons": ["closing"]},
+            {"scene_id": 1, "chapter_id": "opening", "role": "opening", "priority_band": "high", "planned_duration_seconds": 2.0, "representative_tag": "風景", "semantic_summary": "導入", "selection_reasons": ["opening"], "include": True},
+            {"scene_id": 2, "chapter_id": "body", "role": "support", "priority_band": "low", "planned_duration_seconds": 1.8, "representative_tag": "風景", "semantic_summary": "つなぎ", "selection_reasons": ["support"], "include": False},
+            {"scene_id": 3, "chapter_id": "body", "role": "highlight", "priority_band": "high", "planned_duration_seconds": 2.6, "representative_tag": "寺社", "semantic_summary": "見どころ", "selection_reasons": ["highlight"], "selected_for_edit": True, "include": True},
+            {"scene_id": 4, "chapter_id": "closing", "role": "closing", "priority_band": "medium", "planned_duration_seconds": 2.1, "representative_tag": "夜景", "semantic_summary": "締め", "selection_reasons": ["closing"], "include": True},
         ],
     }
     plan_payload = {
         "title": "東京の旅",
-        "logline": "導入から余韻まで自然につなぐ。",
-        "chapter_list": [{"chapter_id": "opening", "title": "旅のはじまり", "purpose": "導入", "scene_ids": [1], "editing_note": "ゆっくり入る"}],
-        "scene_directions": [{"scene_ids": [1], "chapter_id": "opening", "emphasis": "high", "recommended_duration_seconds": 2.0, "direction": "景色から始める"}],
-        "subtitle_plan": {"enabled": True, "style": "overlay", "items": [{"scene_ids": [1], "text": "旅のはじまり"}]},
-        "ending_note": "静かな余韻で終える",
+        "logline": "人々の笑顔があふれる感動の旅。",
+        "chapter_list": [
+            {"chapter_id": "opening", "title": "旅のはじまり", "purpose": "導入", "scene_ids": [1], "editing_note": "ゆっくり入る"},
+            {"chapter_id": "body", "title": "旅の流れ", "purpose": "見どころ", "scene_ids": [2, 3], "editing_note": "グループ写真を挿入して楽しさを強める"},
+            {"chapter_id": "closing", "title": "旅の余韻", "purpose": "締め", "scene_ids": [4], "editing_note": "余韻を残す"},
+        ],
+        "scene_directions": [
+            {"scene_ids": [1], "chapter_id": "opening", "emphasis": "high", "recommended_duration_seconds": 2.0, "direction": "景色から始める"},
+            {"scene_ids": [2], "chapter_id": "body", "emphasis": "low", "recommended_duration_seconds": 1.8, "direction": "移動中の風景を挿入する"},
+            {"scene_ids": [3], "chapter_id": "body", "emphasis": "high", "recommended_duration_seconds": 2.6, "direction": "笑顔や表情を捉えて感動を強める"},
+            {"scene_ids": [4], "chapter_id": "closing", "emphasis": "medium", "recommended_duration_seconds": 2.1, "direction": "夕暮れの風景とBGMで締める"},
+        ],
+        "subtitle_plan": {
+            "enabled": True,
+            "style": "overlay",
+            "items": [
+                {"scene_ids": [1], "text": "旅のはじまり"},
+                {"scene_ids": [2], "text": "街の散策"},
+                {"scene_ids": [3], "text": "旅のハイライト"},
+                {"scene_ids": [4], "text": "旅の終わり"},
+            ],
+        },
+        "ending_note": "感動的なBGMで余韻を残す",
     }
 
     class FakeUsage:
@@ -977,6 +1001,14 @@ def test_generate_slideshow_plan_uses_structured_output() -> None:
     assert token_usage["request_token_count"] == 111
     assert token_usage["total_token_count"] == 222
     assert "Gemini Slideshow Prompt" in prompt_text
+    assert [chapter["scene_ids"] for chapter in plan["chapter_list"]] == [[1], [3], [4]]
+    assert [direction["scene_ids"] for direction in plan["scene_directions"]] == [[1], [3], [4]]
+    assert [item["scene_ids"] for item in plan["subtitle_plan"]["items"]] == [[1], [3], [4]]
+    assert plan["logline"] == "3 scene を 3 章でつなぎ、風景と寺社を軸に旅の流れを整える。"
+    assert plan["chapter_list"][1]["editing_note"] == "見どころを素直に見せる。"
+    assert plan["scene_directions"][1]["direction"] == "寺社を見どころとして素直に見せる。見どころ"
+    assert plan["scene_directions"][2]["direction"] == "夜景で締め、旅の余韻を自然に残す。"
+    assert plan["ending_note"] == "scene のつながり、尺、字幕の密度を見ながら、全体の流れが自然に見えるよう微調整してください。"
 
 
 def test_tagging_to_gemini_smoke(monkeypatch, media_info_csv: Path, sample_root: Path, materialized_media_files: list[Path], tmp_path: Path) -> None:
